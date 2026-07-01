@@ -2,7 +2,7 @@
 
 A rewrite of the classic [**oneko**](https://github.com/tie/oneko) desktop cat, in **Rust**, for **Arch Linux + Hyprland**.
 
-A little pixel-art cat chases your cursor around the screen. When you stop moving the mouse it sits down, washes itself, and eventually falls asleep — just like the 1990s X11 original, but running natively on Wayland.
+A little pixel-art cat chases your cursor around the screen. When you stop moving the mouse it sits down, washes itself, and eventually falls asleep — just like the 1990s X11 original, but running natively on Wayland. Click the cat to freeze it in place; click again to let it resume chasing.
 
 ![demo](demo.gif)
 
@@ -13,9 +13,13 @@ The original oneko (and most clones) rely on X11 tricks — override-redirect wi
 - **`wlr-layer-shell`** (via [smithay-client-toolkit](https://crates.io/crates/smithay-client-toolkit)) for an always-on-top overlay surface
 - **ARGB transparency** instead of the X11 SHAPE extension
 - **`hyprctl cursorpos`** to track the cursor globally
-- An **empty input region**, so the cat never blocks your clicks or steals focus
+- A **small input region matching the cat's 32×32 box**, so it can catch clicks to toggle freezing without stealing focus or blocking anything outside its own bounds
 
 The original 32×32 XBM sprites are embedded directly in the binary — no asset files needed.
+
+## Usage
+
+Left-click the cat to freeze it in place; click again to unfreeze. While frozen it still sits, washes, and sleeps if left alone — it just won't chase. Every so often while idle, the cat may pop up a tiny speech bubble ("meow", "purrr~"...) or do a quirky animation like a stretch or tail-flick, then carry on as normal.
 
 ## Requirements
 
@@ -59,6 +63,7 @@ Stop it with `pkill oneko-rust`.
 ## Limitations
 
 - Single-monitor: the layer surface lives on the monitor it spawns on, while cursor coordinates are global. Multi-monitor support would need per-output surfaces.
+- Clicks landing inside the cat's current 32×32 box are consumed to detect the freeze toggle, so anything beneath the cat at that instant won't receive that click.
 
 ## Credits
 

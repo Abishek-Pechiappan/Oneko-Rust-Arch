@@ -1,16 +1,37 @@
+// oneko-rust: a desktop cat that chases your cursor on Hyprland/Wayland.
+//
+// How the file is laid out, top to bottom:
+//   1. Cat sprite bitmaps (CAT_*)      - hand-embedded pixel art, see the
+//                                        comment above CAT_RIGHT1 for the format.
+//   2. CatState / Dir / helpers        - direction + animation-state logic.
+//   3. Canvas/bubble layout consts     - sizing for the cat + speech bubble.
+//   4. Bitmap font + draw_text/bubble  - renders the little speech bubbles.
+//   5. Moment / MOMENTS                - the random "cat says/does something
+//                                        cute" system; add new phrases here.
+//   6. struct Cat + impl Cat           - all the per-tick state and drawing.
+//   7. *Handler impls + delegate_*!    - boilerplate wiring for SCTK/Wayland
+//                                        event dispatch; skip unless you're
+//                                        changing what Wayland events we react to.
+//   8. main()                          - connects to Wayland, creates the
+//                                        overlay surface, then loops tick().
 use std::{thread, time::Duration};
 
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, Region},
-    delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
+    delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
+    delegate_seat, delegate_shm,
     output::{OutputHandler, OutputState},
     reexports::client::{
         globals::registry_queue_init,
-        protocol::{wl_output, wl_shm, wl_surface},
+        protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
         Connection, QueueHandle,
     },
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
+    seat::{
+        pointer::{PointerEvent, PointerEventKind, PointerHandler},
+        Capability, SeatHandler, SeatState,
+    },
     shell::{
         wlr_layer::{
             Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
@@ -21,6 +42,31 @@ use smithay_client_toolkit::{
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
 
+// linux/input-event-codes.h
+const BTN_LEFT: u32 = 0x110;
+
+// --- Cat sprites ---
+//
+// Each cat pose is a pair of 32x32 1-bit XBM-style bitmaps: `CAT_X` (the
+// sprite bits) and `CAT_X_MASK` (which pixels are opaque at all). Both are
+// packed as 128 bytes = 32 rows x 4 bytes/row, LSB-first (bit 0 of the first
+// byte is the leftmost pixel). At draw time (see `Cat::draw` below):
+//   mask bit set + sprite bit set => opaque black
+//   mask bit set, sprite bit clear => opaque white
+//   mask bit clear                 => transparent
+//
+// These were carried over from the original X11 oneko's XBM art, so they're
+// unlikely to need hand-editing. To ADD a new pose (like CAT_STRETCH /
+// CAT_TAILFLICK further down), the easiest way is to programmatically decode
+// an existing sprite to an ASCII grid, edit that, then re-encode using the
+// same bit layout — see the git history for the scripts used to do this,
+// since hand-flipping individual hex bits is extremely error-prone.
+//
+// Below: one pair per compass direction while chasing the cursor (2 frames
+// each, for a walking-animation flicker), then the idle poses, then the
+// "quirky" one-off poses used by the Moment system.
+
+// Running east (right), 2 animation frames.
 const CAT_RIGHT1: [u8; 128] = [
     0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x70,0x00,0x00,
     0x00,0x8c,0x01,0x00, 0x00,0x03,0x06,0x00, 0x80,0x00,0x08,0x00, 0x80,0x00,0x10,0x00,
@@ -63,6 +109,7 @@ const CAT_RIGHT2_MASK: [u8; 128] = [
     0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
 ];
 
+// Running west (left), 2 animation frames.
 const CAT_LEFT1: [u8; 128] = [
     0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x0e,0x00,
     0x00,0x80,0x31,0x00, 0x00,0x60,0xc0,0x00, 0x00,0x10,0x00,0x01, 0x00,0x08,0x00,0x01,
@@ -105,6 +152,7 @@ const CAT_LEFT2_MASK: [u8; 128] = [
     0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
 ];
 
+// Running north (up), 2 animation frames.
 const CAT_UP1: [u8; 128] = [
     0x00,0xc0,0x03,0x00, 0x00,0x3e,0x7c,0x00, 0x00,0x08,0x10,0x00, 0x00,0x26,0x64,0x00,
     0x00,0x22,0x44,0x00, 0x00,0x22,0x44,0x00, 0x00,0x01,0x80,0x00, 0x00,0x1f,0xf8,0x00,
@@ -147,6 +195,7 @@ const CAT_UP2_MASK: [u8; 128] = [
     0x00,0x0f,0xf0,0x00, 0x00,0x06,0x60,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
 ];
 
+// Running south (down), 2 animation frames.
 const CAT_DOWN1: [u8; 128] = [
     0x00,0x80,0x01,0x00, 0x00,0x40,0x02,0x00, 0x00,0x40,0x02,0x00, 0x00,0x40,0x02,0x00,
     0x00,0x40,0x02,0x00, 0x00,0x40,0x02,0x00, 0x00,0x78,0x1e,0x00, 0x00,0x04,0x20,0x00,
@@ -189,6 +238,7 @@ const CAT_DOWN2_MASK: [u8; 128] = [
     0x00,0x3c,0x78,0x00, 0x00,0x3c,0x78,0x00, 0x00,0x18,0x30,0x00, 0x00,0x00,0x00,0x00,
 ];
 
+// Running northeast (diagonal), 2 animation frames.
 const CAT_NE1: [u8; 128] = [
     0x00,0xe0,0x00,0x00, 0x00,0x20,0xff,0x01, 0x00,0x20,0x1e,0x02, 0x00,0x20,0xa4,0x07,
     0x00,0x20,0x44,0x6c, 0x00,0x20,0x84,0x18, 0x00,0x20,0x04,0x08, 0x00,0x20,0x00,0x08,
@@ -231,6 +281,7 @@ const CAT_NE2_MASK: [u8; 128] = [
     0x03,0x0f,0x00,0x00, 0x00,0x0f,0x00,0x00, 0x00,0x0f,0x00,0x00, 0x00,0x06,0x00,0x00,
 ];
 
+// Running northwest (diagonal), 2 animation frames.
 const CAT_NW1: [u8; 128] = [
     0x00,0x00,0x07,0x00, 0x80,0xff,0x04,0x00, 0x40,0x78,0x04,0x00, 0xe0,0x25,0x04,0x00,
     0x36,0x22,0x04,0x00, 0x18,0x21,0x04,0x00, 0x10,0x20,0x04,0x00, 0x10,0x00,0x04,0x00,
@@ -273,6 +324,7 @@ const CAT_NW2_MASK: [u8; 128] = [
     0x00,0x00,0xf0,0xc0, 0x00,0x00,0xf0,0x00, 0x00,0x00,0xf0,0x00, 0x00,0x00,0x60,0x00,
 ];
 
+// Running southeast (diagonal), 2 animation frames.
 const CAT_SE1: [u8; 128] = [
     0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x07,0x00,0x00, 0xe0,0x38,0x00,0x00,
     0x10,0xe0,0x03,0x00, 0xe0,0x0f,0x04,0x00, 0x80,0x03,0x08,0x00, 0xc0,0x00,0x10,0x00,
@@ -315,6 +367,7 @@ const CAT_SE2_MASK: [u8; 128] = [
     0x00,0x00,0x78,0x3c, 0x00,0x00,0x70,0x18, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
 ];
 
+// Running southwest (diagonal), 2 animation frames.
 const CAT_SW1: [u8; 128] = [
     0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0xe0,0x00, 0x00,0x00,0x1c,0x07,
     0x00,0xc0,0x07,0x08, 0x00,0x20,0xf0,0x07, 0x00,0x10,0xc0,0x00, 0x00,0x08,0x00,0x03,
@@ -357,6 +410,9 @@ const CAT_SW2_MASK: [u8; 128] = [
     0x3c,0x1e,0x00,0x00, 0x18,0x0e,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
 ];
 
+// --- Idle poses (cursor has stopped moving; see idle_ticks in Cat::tick) ---
+
+// First idle stage: cat sits and watches. Single frame (no animation).
 const CAT_SITTING: [u8; 128] = [
     0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x10,0x10,0x00,
     0x00,0x28,0x28,0x00, 0x00,0x48,0x24,0x00, 0x00,0x44,0x44,0x00, 0x00,0x84,0x42,0x00,
@@ -378,6 +434,7 @@ const CAT_SITTING_MASK: [u8; 128] = [
     0xe0,0xff,0xfe,0x7f, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
 ];
 
+// Second idle stage: cat washes itself. 2 animation frames.
 const CAT_WASHING_1: [u8; 128] = [
     0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x20,0x00,0x00,0x04, 0x40,0x10,0x10,0x02,
     0x80,0x28,0x28,0x01, 0x00,0x49,0x24,0x00, 0x06,0x44,0x44,0x60, 0x18,0x84,0x42,0x18,
@@ -420,6 +477,7 @@ const CAT_WASHING_2_MASK: [u8; 128] = [
     0xe0,0xff,0xfe,0x0f, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
 ];
 
+// Third idle stage: cat falls asleep. 2 animation frames (slow alternation).
 const CAT_SLEEPING_1: [u8; 128] = [
     0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xc0,0x1f,0x00,0x00,
     0x00,0x08,0x00,0x00, 0x00,0x05,0x00,0x00, 0x00,0x02,0x00,0x00, 0x00,0x05,0x1f,0x00,
@@ -462,12 +520,71 @@ const CAT_SLEEPING_2_MASK: [u8; 128] = [
     0x00,0xff,0xff,0x7f, 0x00,0xe0,0x9f,0x3f, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
 ];
 
+// --- Quirky one-off poses ---
+// Used only via the Moment system (see MOMENTS below); each is a single
+// static sprite, not a full animation state. Both are variations built from
+// CAT_SITTING (see git history for how the tail curl / stretch body were
+// added into empty space around that base pose).
+
+// Sitting pose with a small curled tail added off to the side (silent quirk,
+// no speech bubble text — see the last entry in MOMENTS).
+const CAT_TAILFLICK: [u8; 128] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x10, 0x00,
+    0x00, 0x28, 0x28, 0x00, 0x00, 0x48, 0x24, 0x00, 0x00, 0x44, 0x44, 0x00, 0x00, 0x84, 0x42, 0x00,
+    0x00, 0x82, 0x83, 0x00, 0x00, 0x02, 0x80, 0x00, 0x00, 0x22, 0x88, 0x00, 0x00, 0x22, 0x88, 0x00,
+    0x00, 0x22, 0x88, 0x00, 0x00, 0x02, 0x80, 0x00, 0x00, 0x3a, 0xb9, 0x0e, 0x00, 0x04, 0x40, 0x16,
+    0x00, 0x08, 0x20, 0x28, 0x00, 0x70, 0x1c, 0x50, 0x00, 0x40, 0x04, 0x60, 0x00, 0x20, 0x08, 0x50,
+    0x00, 0x10, 0x10, 0x28, 0x00, 0x08, 0x20, 0x14, 0x00, 0x0b, 0xa0, 0x0d, 0x80, 0x0c, 0x61, 0x0e,
+    0x40, 0x18, 0x31, 0x04, 0x40, 0x10, 0x11, 0x04, 0xc0, 0x11, 0x11, 0x7f, 0x60, 0x90, 0x13, 0x84,
+    0xe0, 0xff, 0xfe, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+const CAT_TAILFLICK_MASK: [u8; 128] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x10, 0x00,
+    0x00, 0x38, 0x38, 0x00, 0x00, 0x78, 0x3c, 0x00, 0x00, 0x7c, 0x7c, 0x00, 0x00, 0xfc, 0x7e, 0x00,
+    0x00, 0xfe, 0xff, 0x00, 0x00, 0xfe, 0xff, 0x00, 0x00, 0xfe, 0xff, 0x00, 0x00, 0xfe, 0xff, 0x00,
+    0x00, 0xfe, 0xff, 0x00, 0x00, 0xfe, 0xff, 0x00, 0x00, 0xfe, 0xff, 0x0e, 0x00, 0xfc, 0x7f, 0x1e,
+    0x00, 0xf8, 0x3f, 0x38, 0x00, 0xf0, 0x1f, 0x70, 0x00, 0xc0, 0x07, 0x60, 0x00, 0xe0, 0x0f, 0x70,
+    0x00, 0xf0, 0x1f, 0x38, 0x00, 0xf8, 0x3f, 0x1c, 0x00, 0xfb, 0xbf, 0x0d, 0x80, 0xff, 0xff, 0x0f,
+    0xc0, 0xff, 0xff, 0x07, 0xc0, 0xff, 0xff, 0x07, 0xc0, 0xff, 0xff, 0x7f, 0xe0, 0xff, 0xff, 0xff,
+    0xe0, 0xff, 0xfe, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+// Cat mid-stretch: reuses CAT_SITTING's head/ears/face verbatim, with a
+// fresh low body (front paws extended, raised rear haunch + tail) below it.
+const CAT_STRETCH: [u8; 128] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x24, 0x00, 0x10, 0x10, 0xc4,
+    0x00, 0x28, 0x28, 0x84, 0x00, 0x48, 0x24, 0x84, 0x00, 0x44, 0x44, 0x84, 0x00, 0x84, 0x42, 0x84,
+    0x00, 0x82, 0x83, 0x42, 0x00, 0x02, 0x80, 0x42, 0x00, 0x22, 0x88, 0x42, 0x00, 0x22, 0x88, 0x42,
+    0x00, 0x22, 0x88, 0x42, 0x00, 0x02, 0x80, 0x42, 0x00, 0x3a, 0xb9, 0x42, 0x00, 0x04, 0x00, 0x41,
+    0x00, 0x04, 0x00, 0x40, 0x00, 0x04, 0x00, 0x40, 0x00, 0x04, 0x00, 0x40, 0xff, 0x03, 0x00, 0x40,
+    0x01, 0x00, 0x00, 0x40, 0x01, 0xe0, 0x7f, 0x40, 0x01, 0x10, 0x80, 0x40, 0x03, 0x1c, 0x80, 0x40,
+    0x04, 0x02, 0x80, 0x40, 0x04, 0x02, 0x80, 0x40, 0xfc, 0x03, 0x80, 0x7f, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+const CAT_STRETCH_MASK: [u8; 128] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x10, 0x10, 0xfc,
+    0x00, 0x38, 0x38, 0xfc, 0x00, 0x78, 0x3c, 0xfc, 0x00, 0x7c, 0x7c, 0xfc, 0x00, 0xfc, 0x7e, 0xfc,
+    0x00, 0xfe, 0xff, 0x7e, 0x00, 0xfe, 0xff, 0x7e, 0x00, 0xfe, 0xff, 0x7e, 0x00, 0xfe, 0xff, 0x7e,
+    0x00, 0xfe, 0xff, 0x7e, 0x00, 0xfe, 0xff, 0x7e, 0x00, 0xfe, 0xff, 0x7e, 0x00, 0xfc, 0xff, 0x7f,
+    0x00, 0xfc, 0xff, 0x7f, 0x00, 0xfc, 0xff, 0x7f, 0x00, 0xfc, 0xff, 0x7f, 0xff, 0xff, 0xff, 0x7f,
+    0xff, 0xff, 0xff, 0x7f, 0xff, 0xff, 0xff, 0x7f, 0xff, 0x1f, 0x80, 0x7f, 0xff, 0x1f, 0x80, 0x7f,
+    0xfc, 0x03, 0x80, 0x7f, 0xfc, 0x03, 0x80, 0x7f, 0xfc, 0x03, 0x80, 0x7f, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+// The cat's current activity, driven by how long the cursor has been idle
+// (see idle_ticks / the thresholds in Cat::tick).
 #[derive(Clone, Copy, PartialEq)]
 enum CatState { Chasing, Sitting, Washing, Sleeping }
 
+// 8-way compass direction the cat is facing/running, used to pick which
+// CAT_* sprite pair to show while Chasing.
 #[derive(Clone, Copy, PartialEq)]
 enum Dir { N, NE, E, SE, S, SW, W, NW }
 
+// Turns a cursor-relative offset into one of the 8 compass directions.
+// Uses a 2:1 ratio to bias toward the 4 cardinal directions (N/E/S/W) over
+// the diagonals, so the cat doesn't flicker between them too easily.
 fn dir_from_delta(dx: f32, dy: f32) -> Dir {
     let adx = dx.abs();
     let ady = dy.abs();
@@ -485,6 +602,11 @@ fn dir_from_delta(dx: f32, dy: f32) -> Dir {
     }
 }
 
+// Global cursor position in screen (layout) coordinates, via Hyprland's own
+// CLI. This is the one Hyprland-specific dependency in the whole program;
+// porting to another wlroots compositor means replacing this function with
+// whatever that compositor exposes for global pointer position. Returns
+// (0, 0) if hyprctl isn't available or its output can't be parsed.
 fn mouse_pos() -> (f32, f32) {
     let Ok(output) = std::process::Command::new("hyprctl")
         .args(["cursorpos"])
@@ -499,28 +621,206 @@ fn mouse_pos() -> (f32, f32) {
     (x, y)
 }
 
+// The cat sprite itself is always exactly SIZE x SIZE pixels.
 const SIZE: u32 = 32;
 
+// The Wayland surface/buffer is bigger than the cat (CANVAS_W x CANVAS_H),
+// with BUBBLE_H extra rows of empty space above it to draw a speech bubble
+// into when one is active. The cat sprite is always drawn bottom-anchored
+// and horizontally centered within that canvas, at (CAT_X_OFFSET,
+// CAT_Y_OFFSET) - see Cat::draw. To make the bubble area bigger/smaller,
+// tweak CANVAS_W (width, e.g. for longer phrases) and/or BUBBLE_H (height).
+const CANVAS_W: u32 = 72;
+const BUBBLE_H: u32 = 16;
+const CANVAS_H: u32 = SIZE + BUBBLE_H;
+const CAT_X_OFFSET: i32 = ((CANVAS_W - SIZE) / 2) as i32;
+const CAT_Y_OFFSET: i32 = BUBBLE_H as i32;
+
+// Size of one character cell in the speech-bubble font, in pixels.
+const GLYPH_W: usize = 5;
+const GLYPH_H: usize = 7;
+
+// 5x7 pixel font, one row per byte, bit 4 = leftmost column (so the binary
+// literals read left-to-right the same as the glyph shape, e.g. 0b01110 is
+// ".###."). Only covers the characters actually used by MOMENTS below - if
+// you add a phrase with a new character, add its glyph here too, or
+// draw_text will silently skip that character (see glyph_for).
+const FONT: &[(char, [u8; GLYPH_H])] = &[
+    ('m', [0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b00000]),
+    ('e', [0b11110, 0b10000, 0b11110, 0b10000, 0b10000, 0b11110, 0b00000]),
+    ('o', [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110, 0b00000]),
+    ('w', [0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001, 0b00000]),
+    ('z', [0b11111, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111, 0b00000]),
+    ('!', [0b00100, 0b00100, 0b00100, 0b00100, 0b00000, 0b00100, 0b00000]),
+    ('?', [0b01110, 0b10001, 0b00010, 0b00100, 0b00000, 0b00100, 0b00000]),
+    ('~', [0b00000, 0b00000, 0b01001, 0b10110, 0b00000, 0b00000, 0b00000]),
+    ('*', [0b00000, 0b10101, 0b01110, 0b11111, 0b01110, 0b10101, 0b00000]),
+    ('r', [0b11110, 0b10001, 0b10001, 0b11110, 0b10010, 0b10001, 0b00000]),
+    ('p', [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b00000]),
+    ('u', [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110, 0b00000]),
+    ('n', [0b10001, 0b11001, 0b10101, 0b10101, 0b10011, 0b10001, 0b00000]),
+    ('y', [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00000]),
+    ('a', [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b00000]),
+    ('h', [0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b00000]),
+    ('i', [0b00100, 0b00000, 0b00100, 0b00100, 0b00100, 0b00100, 0b00000]),
+    ('s', [0b01111, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110, 0b00000]),
+    ('c', [0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111, 0b00000]),
+    ('t', [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00000]),
+];
+
+// Looks up a character's glyph in FONT; None for anything not in the table
+// (draw_text just skips those, so unsupported characters render as blanks).
+fn glyph_for(c: char) -> Option<&'static [u8; GLYPH_H]> {
+    FONT.iter().find(|(fc, _)| *fc == c).map(|(_, g)| g)
+}
+
+// Writes one solid-color pixel block into an ARGB8888 canvas, matching the
+// byte layout used by draw()/create_buffer (4 bytes per pixel, row-major).
+fn put_pixel(canvas: &mut [u8], canvas_w: usize, x: i32, y: i32, argb: u32) {
+    if x < 0 || y < 0 || x as usize >= canvas_w {
+        return;
+    }
+    let idx = (y as usize * canvas_w + x as usize) * 4;
+    if idx + 4 <= canvas.len() {
+        canvas[idx..idx + 4].copy_from_slice(&argb.to_le_bytes());
+    }
+}
+
+// Pixel width `text` would render at, at the given integer upscale factor
+// (1 glyph pixel becomes `scale` x `scale` screen pixels). Used to center
+// the speech bubble box around its text; see draw_bubble.
+fn text_width(text: &str, scale: i32) -> i32 {
+    text.chars().count() as i32 * (GLYPH_W as i32 + 1) * scale - scale
+}
+
+// Draws `text` in solid black starting at (x0, y0), one glyph after another,
+// each glyph pixel blown up to a `scale` x `scale` block.
+fn draw_text(canvas: &mut [u8], canvas_w: usize, text: &str, x0: i32, y0: i32, scale: i32) {
+    let mut cx = x0;
+    for ch in text.chars() {
+        if let Some(glyph) = glyph_for(ch) {
+            for (row, bits) in glyph.iter().enumerate() {
+                for col in 0..GLYPH_W {
+                    if bits & (1 << (GLYPH_W - 1 - col)) != 0 {
+                        for sy in 0..scale {
+                            for sx in 0..scale {
+                                put_pixel(
+                                    canvas,
+                                    canvas_w,
+                                    cx + col as i32 * scale + sx,
+                                    y0 + row as i32 * scale + sy,
+                                    0xFF00_0000,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cx += (GLYPH_W as i32 + 1) * scale;
+    }
+}
+
+// Draws a small white speech-bubble box (black 1px border + downward nub)
+// sized to fit `text`, then the text itself in black on top.
+// SCALE is the font upscale factor (1 = native glyph pixels, 2 = double
+// size, etc.) and PAD is the empty margin in pixels around the text inside
+// the box - bump either up if the bubble/text ever needs to look bigger.
+fn draw_bubble(canvas: &mut [u8], canvas_w: usize, text: &str) {
+    const SCALE: i32 = 1;
+    const PAD: i32 = 2;
+    let text_w = text_width(text, SCALE);
+    let box_w = text_w + PAD * 2;
+    let box_h = GLYPH_H as i32 * SCALE + PAD * 2;
+    let box_x0 = (canvas_w as i32 - box_w) / 2;
+    let box_y0 = 1;
+
+    for y in box_y0..box_y0 + box_h {
+        for x in box_x0..box_x0 + box_w {
+            let on_border = x == box_x0 || x == box_x0 + box_w - 1 || y == box_y0 || y == box_y0 + box_h - 1;
+            let argb = if on_border { 0xFF00_0000 } else { 0xFFFF_FFFF };
+            put_pixel(canvas, canvas_w, x, y, argb);
+        }
+    }
+    // Small downward-pointing nub connecting the bubble to the cat.
+    let nub_x = canvas_w as i32 / 2;
+    let nub_y0 = box_y0 + box_h;
+    for (i, y) in (nub_y0..nub_y0 + 2).enumerate() {
+        for x in (nub_x - 1 + i as i32)..=(nub_x + 1 - i as i32) {
+            put_pixel(canvas, canvas_w, x, y, 0xFF00_0000);
+        }
+    }
+
+    draw_text(canvas, canvas_w, text, box_x0 + PAD, box_y0 + PAD, SCALE);
+}
+
+// One entry in the random "flavor" table below: a speech-bubble phrase
+// and/or a sprite override to briefly show instead of the normal idle pose.
+// `text: ""` means no bubble (quirk-only); `quirk: None` means no sprite
+// change (speech-only, cat keeps its normal idle animation).
+struct Moment {
+    text: &'static str,
+    quirk: Option<(&'static [u8; 128], &'static [u8; 128])>,
+}
+
+// The pool of things the cat can randomly say/do while idle (see the
+// "Moment" trigger logic in Cat::tick). To add a new phrase, just add an
+// entry here - make sure every character in it has a glyph in FONT above.
+// To add a new quirky animation, hand-author a sprite pair (see the comment
+// above CAT_TAILFLICK) and reference it here.
+const MOMENTS: &[Moment] = &[
+    Moment { text: "meow", quirk: None },
+    Moment { text: "meow?", quirk: None },
+    Moment { text: "meow!", quirk: None },
+    Moment { text: "mrow", quirk: None },
+    Moment { text: "purrr~", quirk: None },
+    Moment { text: "nya~", quirk: None },
+    Moment { text: "mew", quirk: None },
+    Moment { text: "zzz", quirk: None },
+    Moment { text: "hiss!", quirk: None },
+    Moment { text: "?!", quirk: None },
+    Moment { text: "*stretch*", quirk: Some((&CAT_STRETCH, &CAT_STRETCH_MASK)) },
+    Moment { text: "", quirk: Some((&CAT_TAILFLICK, &CAT_TAILFLICK_MASK)) },
+];
+
+// All the state for the one cat surface. Wayland/SCTK plumbing fields first
+// (registry/output/seat/shm/pool/layer/input_region - boilerplate needed to
+// own and draw to a wlr-layer-shell surface), then the actual cat behavior
+// state below `exit`.
 struct Cat {
     registry_state: RegistryState,
     output_state: OutputState,
+    seat_state: SeatState,
+    pointer: Option<wl_pointer::WlPointer>,
     shm: Shm,
     pool: SlotPool,
     layer: LayerSurface,
-    _input_region: Region,
-    configured: bool,
-    exit: bool,
+    _input_region: Region, // kept alive only; never read after setup
+    configured: bool,      // true once the compositor has sent an initial configure event
+    exit: bool,            // set when the layer surface is closed by the compositor
+
     screen_w: f32,
     screen_h: f32,
-    win_x: f32,
-    win_y: f32,
-    last_cursor: (f32, f32),
-    dir: Dir,
-    frame: bool,
-    idle_ticks: u32,
+
+    win_x: f32, // cat's on-screen position (top-left of its own 32x32 box,
+    win_y: f32, // not the enlarged canvas - see CAT_X/Y_OFFSET)
+
+    last_cursor: (f32, f32), // cursor position as of the previous tick, to detect idling
+    dir: Dir,                // facing direction while chasing
+    frame: bool,             // flips every tick; picks between each pose's 2 animation frames
+    idle_ticks: u32,         // consecutive ticks the cursor has been still
+    frozen: bool,            // toggled by clicking the cat; see PointerHandler below
+
+    rng_state: u32,               // xorshift32 seed/state, see Cat::next_u32
+    next_moment_in: u32,          // ticks until the next random speech/quirk moment
+    moment_ticks_remaining: u32,  // ticks left in the currently active moment, if any
+    active_moment: Option<usize>, // index into MOMENTS while a moment is active
 }
 
 impl Cat {
+    // Caches the monitor's logical size, used to clamp the cat's position
+    // so it can't wander off-screen. Called whenever an output appears or
+    // its geometry changes (see OutputHandler below).
     fn update_screen_size(&mut self, output: &wl_output::WlOutput) {
         if let Some((w, h)) = self
             .output_state
@@ -532,40 +832,90 @@ impl Cat {
         }
     }
 
+    // Tiny xorshift32 PRNG (no external `rand` dependency needed for
+    // occasionally picking a random Moment). Must be seeded with a nonzero
+    // value once at startup - see `seed` in main().
+    fn next_u32(&mut self) -> u32 {
+        let mut x = self.rng_state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.rng_state = x;
+        x
+    }
+
+    // Runs once per 125ms main-loop iteration (see the `while` loop in
+    // main()): reads the cursor, updates the cat's animation state and
+    // position, then draws the current frame.
     fn tick(&mut self) {
         let (cursor_x, cursor_y) = mouse_pos();
 
+        // "Idle" means the cursor has barely moved since last tick.
         let cursor_moved = (cursor_x - self.last_cursor.0).abs() > 2.0
             || (cursor_y - self.last_cursor.1).abs() > 2.0;
         self.last_cursor = (cursor_x, cursor_y);
 
         if cursor_moved { self.idle_ticks = 0; } else { self.idle_ticks += 1; }
 
-        let state = if self.idle_ticks >= 20 {
+        // While frozen, keep the cat pinned in place but still let it settle
+        // into its idle animations if the cursor stops moving elsewhere.
+        let idle_ticks = if self.frozen { self.idle_ticks.max(3) } else { self.idle_ticks };
+
+        // Idle-duration thresholds (in ticks @ 125ms each) that step the cat
+        // through its idle animations: Sitting -> Washing -> Sleeping.
+        let state = if idle_ticks >= 20 {
             CatState::Sleeping
-        } else if self.idle_ticks >= 10 {
+        } else if idle_ticks >= 10 {
             CatState::Washing
-        } else if self.idle_ticks >= 3 {
+        } else if idle_ticks >= 3 {
             CatState::Sitting
         } else {
             CatState::Chasing
         };
 
-        let dx = cursor_x - self.win_x;
-        let dy = cursor_y - self.win_y;
-
-        if dx.abs() > 1.0 || dy.abs() > 1.0 {
-            self.dir = dir_from_delta(dx, dy);
+        // Occasional, non-distracting flavor: a speech bubble and/or a
+        // quirky sprite override, only while the cat is already idle.
+        // `moment_ticks_remaining` counts down while one is showing;
+        // `next_moment_in` counts down the (much longer) quiet period
+        // between moments. Tune the two "~Ns" ranges below to change how
+        // often moments happen and how long each one lasts.
+        if self.moment_ticks_remaining > 0 {
+            self.moment_ticks_remaining -= 1;
+        } else {
+            self.active_moment = None;
+            if state != CatState::Chasing {
+                if self.next_moment_in == 0 {
+                    let idx = (self.next_u32() as usize) % MOMENTS.len();
+                    self.active_moment = Some(idx);
+                    self.moment_ticks_remaining = 6 + self.next_u32() % 5; // ~0.75-1.25s
+                    self.next_moment_in = 240 + self.next_u32() % 561; // ~30-100s
+                } else {
+                    self.next_moment_in -= 1;
+                }
+            }
         }
 
-        let max_x = (self.screen_w - SIZE as f32).max(0.0);
-        let max_y = (self.screen_h - SIZE as f32).max(0.0);
-        self.win_x = (self.win_x + dx * 0.3).clamp(0.0, max_x);
-        self.win_y = (self.win_y + dy * 0.3).clamp(0.0, max_y);
+        // Chase the cursor: ease toward it (30% of the remaining distance
+        // per tick, so movement looks smooth rather than snapping), clamped
+        // so the cat can't leave the screen. Skipped entirely while frozen.
+        if !self.frozen {
+            let dx = cursor_x - self.win_x;
+            let dy = cursor_y - self.win_y;
 
-        self.frame = !self.frame;
+            if dx.abs() > 1.0 || dy.abs() > 1.0 {
+                self.dir = dir_from_delta(dx, dy);
+            }
 
-        let (sprite, mask): (&[u8; 128], &[u8; 128]) = match state {
+            let max_x = (self.screen_w - SIZE as f32).max(0.0);
+            let max_y = (self.screen_h - SIZE as f32).max(0.0);
+            self.win_x = (self.win_x + dx * 0.3).clamp(0.0, max_x);
+            self.win_y = (self.win_y + dy * 0.3).clamp(0.0, max_y);
+        }
+
+        self.frame = !self.frame; // alternates true/false each tick, for 2-frame poses
+
+        // Pick which sprite to show for the current state/direction/frame.
+        let (mut sprite, mut mask): (&[u8; 128], &[u8; 128]) = match state {
             CatState::Sitting  => (&CAT_SITTING,    &CAT_SITTING_MASK),
             CatState::Washing  => if self.frame { (&CAT_WASHING_1,  &CAT_WASHING_1_MASK)  }
                                   else          { (&CAT_WASHING_2,  &CAT_WASHING_2_MASK)  },
@@ -592,24 +942,50 @@ impl Cat {
             },
         };
 
-        // Anchored TOP|LEFT, so the top/left margins are the on-screen position.
-        self.layer.set_margin(self.win_y as i32, 0, 0, self.win_x as i32);
-        self.draw(sprite, mask);
+        // If a Moment is currently active, let it override the sprite
+        // and/or supply the speech-bubble text picked above.
+        let mut bubble_text = "";
+        if let Some(idx) = self.active_moment {
+            bubble_text = MOMENTS[idx].text;
+            if let Some((qs, qm)) = MOMENTS[idx].quirk {
+                sprite = qs;
+                mask = qm;
+            }
+        }
+
+        // Anchored TOP|LEFT; the cat's own sub-rect sits CAT_X/Y_OFFSET into
+        // the (larger, bubble-carrying) canvas, so shift the margin back by
+        // that offset to keep the cat itself tracking win_x/win_y exactly.
+        self.layer.set_margin(
+            self.win_y as i32 - CAT_Y_OFFSET,
+            0,
+            0,
+            self.win_x as i32 - CAT_X_OFFSET,
+        );
+        self.draw(sprite, mask, bubble_text);
     }
 
+    // Renders one frame: allocates a fresh ARGB8888 buffer sized to the full
+    // canvas, unpacks `sprite`/`mask` into the cat's sub-rect within it
+    // (everywhere else starts transparent), optionally draws a speech
+    // bubble on top, then attaches and commits the buffer to the surface.
+    //
     // XBM layout: 4 bytes per row, LSB of each byte is the leftmost pixel.
     // mask bit set + sprite bit set => black, mask only => white, else transparent.
-    fn draw(&mut self, sprite: &[u8; 128], mask: &[u8; 128]) {
+    fn draw(&mut self, sprite: &[u8; 128], mask: &[u8; 128], text: &str) {
         let (buffer, canvas) = self
             .pool
             .create_buffer(
-                SIZE as i32,
-                SIZE as i32,
-                (SIZE * 4) as i32,
+                CANVAS_W as i32,
+                CANVAS_H as i32,
+                (CANVAS_W * 4) as i32,
                 wl_shm::Format::Argb8888,
             )
             .expect("create shm buffer");
 
+        canvas.fill(0); // fully transparent by default
+
+        // Unpack the cat's 32x32 bitmap into its offset sub-rect of the canvas.
         for y in 0..SIZE as usize {
             for x in 0..SIZE as usize {
                 let byte = y * 4 + x / 8;
@@ -619,17 +995,29 @@ impl Cat {
                 } else {
                     0
                 };
-                let idx = (y * SIZE as usize + x) * 4;
+                let idx = ((y + CAT_Y_OFFSET as usize) * CANVAS_W as usize
+                    + (x + CAT_X_OFFSET as usize))
+                    * 4;
                 canvas[idx..idx + 4].copy_from_slice(&px.to_le_bytes());
             }
         }
 
+        if !text.is_empty() {
+            draw_bubble(canvas, CANVAS_W as usize, text);
+        }
+
         let surface = self.layer.wl_surface();
-        surface.damage_buffer(0, 0, SIZE as i32, SIZE as i32);
+        surface.damage_buffer(0, 0, CANVAS_W as i32, CANVAS_H as i32);
         buffer.attach_to(surface).expect("attach buffer");
         self.layer.commit();
     }
 }
+
+// --- SCTK/Wayland event-dispatch boilerplate below ---
+// These trait impls just wire Cat up to receive protocol events; most
+// methods are no-ops because this app doesn't care about those events
+// (e.g. we don't need to react to scale/transform changes). Only edit
+// these if you're changing what Wayland events the cat reacts to.
 
 impl CompositorHandler for Cat {
     fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: i32) {}
@@ -639,6 +1027,8 @@ impl CompositorHandler for Cat {
     fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
 }
 
+// Tracks monitor geometry, so Cat::update_screen_size can keep the cat's
+// movement clamp (screen_w/screen_h) up to date.
 impl OutputHandler for Cat {
     fn output_state(&mut self) -> &mut OutputState {
         &mut self.output_state
@@ -655,6 +1045,10 @@ impl OutputHandler for Cat {
     fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
 }
 
+// The two events that matter for our layer-shell surface: the compositor
+// telling us it's ready for content (`configure`, gates the first draw in
+// main()'s loop) and telling us the surface was closed (`closed`, so we can
+// exit cleanly).
 impl LayerShellHandler for Cat {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
         self.exit = true;
@@ -671,20 +1065,81 @@ impl ShmHandler for Cat {
     }
 }
 
+// Binds a pointer as soon as one becomes available, so we can receive click
+// events (see PointerHandler below) to toggle `frozen`.
+impl SeatHandler for Cat {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+
+    fn new_capability(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Pointer && self.pointer.is_none() {
+            self.pointer = Some(self.seat_state.get_pointer(qh, &seat).expect("create pointer"));
+        }
+    }
+
+    fn remove_capability(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Pointer {
+            if let Some(pointer) = self.pointer.take() {
+                pointer.release();
+            }
+        }
+    }
+
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+}
+
+// This is the click-to-freeze feature: any left-button press received on
+// the cat's surface (only possible within its input region - see
+// input_region.add in main()) toggles `frozen`.
+impl PointerHandler for Cat {
+    fn pointer_frame(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_pointer::WlPointer,
+        events: &[PointerEvent],
+    ) {
+        for event in events {
+            if let PointerEventKind::Press { button: BTN_LEFT, .. } = event.kind {
+                self.frozen = !self.frozen;
+            }
+        }
+    }
+}
+
 impl ProvidesRegistryState for Cat {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
     }
-    registry_handlers![OutputState];
+    registry_handlers![OutputState, SeatState];
 }
 
 delegate_compositor!(Cat);
 delegate_output!(Cat);
 delegate_shm!(Cat);
 delegate_layer!(Cat);
+delegate_seat!(Cat);
+delegate_pointer!(Cat);
 delegate_registry!(Cat);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Connect to the Wayland compositor and discover available globals
+    // (compositor, layer-shell, shm, seat, output - the protocols we need).
     let conn = Connection::connect_to_env()?;
     let (globals, mut event_queue) = registry_queue_init(&conn)?;
     let qh = event_queue.handle();
@@ -693,26 +1148,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let layer_shell = LayerShell::bind(&globals, &qh)?;
     let shm = Shm::bind(&globals, &qh)?;
 
+    // Create the always-on-top overlay surface the cat lives on.
     let surface = compositor.create_surface(&qh);
     let layer = layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("oneko"), None);
     layer.set_anchor(Anchor::TOP | Anchor::LEFT);
-    layer.set_size(SIZE, SIZE);
+    // Canvas is bigger than the cat (room for a speech bubble above it).
+    layer.set_size(CANVAS_W, CANVAS_H);
     // Position relative to the full output, ignoring bars' reserved space.
     layer.set_exclusive_zone(-1);
     layer.set_keyboard_interactivity(KeyboardInteractivity::None);
 
-    // Empty input region: clicks pass through the cat.
+    // Input region covers only the cat's own sub-rect so it can receive
+    // clicks (to toggle frozen state) without the bubble area above it ever
+    // blocking clicks; clicks landing on the cat itself no longer pass
+    // through to whatever is beneath it.
     let input_region = Region::new(&compositor)?;
+    input_region.add(CAT_X_OFFSET, CAT_Y_OFFSET, SIZE as i32, SIZE as i32);
     layer.wl_surface().set_input_region(Some(input_region.wl_region()));
 
     layer.commit();
 
-    let pool = SlotPool::new((SIZE * SIZE * 4) as usize, &shm)?;
+    // Shared-memory pool the cat's frames get drawn into (see Cat::draw).
+    let pool = SlotPool::new((CANVAS_W * CANVAS_H * 4) as usize, &shm)?;
+
+    // Seed the PRNG from the clock; xorshift32 needs a nonzero seed, hence `| 1`.
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u32)
+        .unwrap_or(0x9E37_79B9)
+        | 1;
 
     let (init_x, init_y) = mouse_pos();
     let mut cat = Cat {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
+        seat_state: SeatState::new(&globals, &qh),
+        pointer: None,
         shm,
         pool,
         layer,
@@ -727,8 +1198,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dir: Dir::E,
         frame: false,
         idle_ticks: 0,
+        frozen: false,
+        rng_state: seed,
+        next_moment_in: 300,
+        moment_ticks_remaining: 0,
+        active_moment: None,
     };
 
+    // Main loop: one animation tick every 125ms. `cat.configured` only
+    // becomes true after the compositor's first `configure` event (see
+    // LayerShellHandler above), so we don't try to draw before that.
     while !cat.exit {
         if cat.configured {
             cat.tick();

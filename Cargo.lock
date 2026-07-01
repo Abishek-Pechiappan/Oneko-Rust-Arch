@@ -168,7 +168,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "overlay"
+name = "oneko-rust"
 version = "0.1.0"
 dependencies = [
  "smithay-client-toolkit",
