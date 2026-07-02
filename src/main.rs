@@ -24,7 +24,7 @@ use smithay_client_toolkit::{
     reexports::client::{
         globals::registry_queue_init,
         protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
-        Connection, QueueHandle,
+        Connection, Proxy, QueueHandle,
     },
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
@@ -624,6 +624,12 @@ fn mouse_pos() -> (f32, f32) {
 // The cat sprite itself is always exactly SIZE x SIZE pixels.
 const SIZE: u32 = 32;
 
+// The cursor must be within this many pixels of the cat before it'll wake up
+// and chase - see the `near` check in tick_active. Cursor movement farther
+// away than this is ignored entirely, so the cat settles into its idle
+// animations instead of reacting to every mouse movement on screen.
+const CHASE_RADIUS: f32 = 150.0;
+
 // The Wayland surface/buffer is bigger than the cat (CANVAS_W x CANVAS_H),
 // with BUBBLE_H extra rows of empty space above it to draw a speech bubble
 // into when one is active. The cat sprite is always drawn bottom-anchored
@@ -783,188 +789,300 @@ const MOMENTS: &[Moment] = &[
     Moment { text: "", quirk: Some((&CAT_TAILFLICK, &CAT_TAILFLICK_MASK)) },
 ];
 
-// All the state for the one cat surface. Wayland/SCTK plumbing fields first
-// (registry/output/seat/shm/pool/layer/input_region - boilerplate needed to
-// own and draw to a wlr-layer-shell surface), then the actual cat behavior
-// state below `exit`.
-struct Cat {
+// Shared Wayland/SCTK plumbing (registry/output/seat/shm/pool/globals),
+// owned once for the whole process. Per-monitor cat behavior state lives in
+// CatSurface below - one instance per currently-connected output.
+struct App {
     registry_state: RegistryState,
     output_state: OutputState,
     seat_state: SeatState,
     pointer: Option<wl_pointer::WlPointer>,
     shm: Shm,
     pool: SlotPool,
+    compositor: CompositorState,
+    layer_shell: LayerShell,
+    exit: bool, // currently never set to true; the app just idles with zero cats if every output disappears
+
+    cats: Vec<CatSurface>,
+    active_output_id: Option<u32>, // which cat is currently chasing the cursor; the rest stay hidden
+    rng_state: u32,                // xorshift32 seed/state, shared since only the active cat ever draws from it
+}
+
+// Everything about a tick that actually affects the rendered frame. Compared
+// against the previous tick's state so tick_active can skip the SHM
+// allocate/blit/damage/commit entirely when nothing would visually change -
+// see the dirty-check at the end of tick_active. Sprite/mask are compared by
+// value (not pointer identity): they're plain `const [u8; 128]` arrays, and
+// LLVM's constant-merging pass is free to unify two consts that ever become
+// byte-identical, which would make pointer comparison silently wrong.
+#[derive(Clone, Copy, PartialEq)]
+struct DrawState {
+    margin_top: i32,
+    margin_left: i32,
+    sprite: &'static [u8; 128],
+    mask: &'static [u8; 128],
+    bubble_text: &'static str,
+}
+
+// One wlr-layer-shell overlay surface bound to a single output, plus all the
+// per-monitor cat behavior state (position, animation, idle/moment timers).
+// Created in OutputHandler::new_output when a monitor appears, dropped in
+// output_destroyed/LayerShellHandler::closed when it goes away.
+struct CatSurface {
+    output: wl_output::WlOutput,
+    output_id: u32, // OutputInfo.id - stable key, since wl_output's own Eq/Hash isn't relied on
     layer: LayerSurface,
     _input_region: Region, // kept alive only; never read after setup
     configured: bool,      // true once the compositor has sent an initial configure event
-    exit: bool,            // set when the layer surface is closed by the compositor
+    visible: bool,         // true while this is the monitor currently showing the cat
 
-    screen_w: f32,
-    screen_h: f32,
+    logical_position: (i32, i32), // this output's offset in the global/layout coordinate space
+    logical_size: (f32, f32),     // this output's size in that same space; used to clamp movement
 
-    win_x: f32, // cat's on-screen position (top-left of its own 32x32 box,
-    win_y: f32, // not the enlarged canvas - see CAT_X/Y_OFFSET)
+    win_x: f32, // cat's on-screen position, local to this monitor (top-left of
+    win_y: f32, // its own 32x32 box, not the enlarged canvas - see CAT_X/Y_OFFSET)
 
-    last_cursor: (f32, f32), // cursor position as of the previous tick, to detect idling
+    last_cursor: (f32, f32), // local cursor position as of the previous active tick, to detect idling
     dir: Dir,                // facing direction while chasing
     frame: bool,             // flips every tick; picks between each pose's 2 animation frames
     idle_ticks: u32,         // consecutive ticks the cursor has been still
     frozen: bool,            // toggled by clicking the cat; see PointerHandler below
 
-    rng_state: u32,               // xorshift32 seed/state, see Cat::next_u32
     next_moment_in: u32,          // ticks until the next random speech/quirk moment
     moment_ticks_remaining: u32,  // ticks left in the currently active moment, if any
     active_moment: Option<usize>, // index into MOMENTS while a moment is active
+
+    last_drawn: Option<DrawState>, // what's currently actually committed to the compositor;
+                                    // None forces the next tick to draw regardless - see hide()
 }
 
-impl Cat {
-    // Caches the monitor's logical size, used to clamp the cat's position
-    // so it can't wander off-screen. Called whenever an output appears or
-    // its geometry changes (see OutputHandler below).
-    fn update_screen_size(&mut self, output: &wl_output::WlOutput) {
-        if let Some((w, h)) = self
-            .output_state
-            .info(output)
-            .and_then(|info| info.logical_size)
-        {
-            self.screen_w = w as f32;
-            self.screen_h = h as f32;
+// Creates a brand-new overlay surface bound to a specific output (so it can
+// only ever render on that monitor - see LayerShell::create_layer_surface's
+// `Some(&output)` below, the actual fix for the cat being pinned to a single
+// monitor), plus its own input region and freshly-seeded per-monitor state.
+// Called from OutputHandler::new_output whenever a monitor appears.
+fn spawn_cat_surface(
+    compositor: &CompositorState,
+    layer_shell: &LayerShell,
+    qh: &QueueHandle<App>,
+    output: wl_output::WlOutput,
+    output_id: u32,
+    logical_position: (i32, i32),
+    logical_size: (f32, f32),
+    init_cursor: (f32, f32),
+) -> CatSurface {
+    let surface = compositor.create_surface(qh);
+    let layer = layer_shell.create_layer_surface(
+        qh,
+        surface,
+        Layer::Overlay,
+        Some("oneko"),
+        Some(&output),
+    );
+    layer.set_anchor(Anchor::TOP | Anchor::LEFT);
+    // Canvas is bigger than the cat (room for a speech bubble above it).
+    layer.set_size(CANVAS_W, CANVAS_H);
+    // Position relative to the full output, ignoring bars' reserved space.
+    layer.set_exclusive_zone(-1);
+    layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+
+    // Input region covers only the cat's own sub-rect so it can receive
+    // clicks (to toggle frozen state) without the bubble area above it ever
+    // blocking clicks.
+    let input_region = Region::new(compositor).expect("create input region");
+    input_region.add(CAT_X_OFFSET, CAT_Y_OFFSET, SIZE as i32, SIZE as i32);
+    layer.wl_surface().set_input_region(Some(input_region.wl_region()));
+
+    layer.commit();
+
+    let max_x = (logical_size.0 - SIZE as f32).max(0.0);
+    let max_y = (logical_size.1 - SIZE as f32).max(0.0);
+    let win_x = (init_cursor.0 - logical_position.0 as f32).clamp(0.0, max_x);
+    let win_y = (init_cursor.1 - logical_position.1 as f32).clamp(0.0, max_y);
+
+    CatSurface {
+        output,
+        output_id,
+        layer,
+        _input_region: input_region,
+        configured: false,
+        visible: true,
+        logical_position,
+        logical_size,
+        win_x,
+        win_y,
+        last_cursor: (win_x, win_y),
+        dir: Dir::E,
+        frame: false,
+        idle_ticks: 0,
+        frozen: false,
+        next_moment_in: 300,
+        moment_ticks_remaining: 0,
+        active_moment: None,
+        last_drawn: None,
+    }
+}
+
+// Tiny xorshift32 PRNG (no external `rand` dependency needed for
+// occasionally picking a random Moment). Must be seeded with a nonzero
+// value once at startup - see `seed` in main().
+fn next_u32(state: &mut u32) -> u32 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    x
+}
+
+// Runs once per 125ms main-loop iteration, but only for the CatSurface whose
+// output currently contains the cursor (see the `while` loop in main());
+// every other monitor's cat is just hidden, not ticked. `local_x`/`local_y`
+// are the global cursor position already converted into this monitor's own
+// coordinate space, so all the math below is identical to single-monitor
+// oneko - it just runs against whichever monitor is active right now.
+fn tick_active(rng_state: &mut u32, pool: &mut SlotPool, local_x: f32, local_y: f32, cat: &mut CatSurface) {
+    // The cat only wakes up for the cursor once it's within CHASE_RADIUS;
+    // movement farther away than that is treated the same as no movement
+    // at all, so the cat isn't yanked out of its idle animations by every
+    // mouse movement on screen (see CHASE_RADIUS's doc comment). Once it's
+    // already chasing, though, don't re-check the distance every tick - a
+    // fast-moving cursor can easily outrun the cat's 30%-per-tick easing
+    // and briefly land outside the radius mid-chase, which would otherwise
+    // make it give up and fall asleep instead of catching up.
+    let dist = ((local_x - cat.win_x).powi(2) + (local_y - cat.win_y).powi(2)).sqrt();
+    let was_chasing = cat.idle_ticks < 3;
+    let near = was_chasing || dist <= CHASE_RADIUS;
+
+    // "Idle" means the cursor has barely moved since last tick (and is near).
+    let cursor_moved = near
+        && ((local_x - cat.last_cursor.0).abs() > 2.0
+            || (local_y - cat.last_cursor.1).abs() > 2.0);
+    cat.last_cursor = (local_x, local_y);
+
+    if cursor_moved { cat.idle_ticks = 0; } else { cat.idle_ticks += 1; }
+
+    // While frozen, keep the cat pinned in place but still let it settle
+    // into its idle animations if the cursor stops moving elsewhere.
+    let idle_ticks = if cat.frozen { cat.idle_ticks.max(3) } else { cat.idle_ticks };
+
+    // Idle-duration thresholds (in ticks @ 125ms each) that step the cat
+    // through its idle animations: Sitting -> Washing -> Sleeping.
+    let state = if idle_ticks >= 20 {
+        CatState::Sleeping
+    } else if idle_ticks >= 10 {
+        CatState::Washing
+    } else if idle_ticks >= 3 {
+        CatState::Sitting
+    } else {
+        CatState::Chasing
+    };
+
+    // Occasional, non-distracting flavor: a speech bubble and/or a
+    // quirky sprite override, only while the cat is already idle.
+    // `moment_ticks_remaining` counts down while one is showing;
+    // `next_moment_in` counts down the (much longer) quiet period
+    // between moments. Tune the two "~Ns" ranges below to change how
+    // often moments happen and how long each one lasts.
+    if cat.moment_ticks_remaining > 0 {
+        cat.moment_ticks_remaining -= 1;
+    } else {
+        cat.active_moment = None;
+        if state != CatState::Chasing {
+            if cat.next_moment_in == 0 {
+                let idx = (next_u32(rng_state) as usize) % MOMENTS.len();
+                cat.active_moment = Some(idx);
+                cat.moment_ticks_remaining = 6 + next_u32(rng_state) % 5; // ~0.75-1.25s
+                cat.next_moment_in = 240 + next_u32(rng_state) % 561; // ~30-100s
+            } else {
+                cat.next_moment_in -= 1;
+            }
         }
     }
 
-    // Tiny xorshift32 PRNG (no external `rand` dependency needed for
-    // occasionally picking a random Moment). Must be seeded with a nonzero
-    // value once at startup - see `seed` in main().
-    fn next_u32(&mut self) -> u32 {
-        let mut x = self.rng_state;
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        self.rng_state = x;
-        x
+    // Chase the cursor: ease toward it (30% of the remaining distance
+    // per tick, so movement looks smooth rather than snapping), clamped
+    // so the cat can't leave this monitor. Skipped while frozen or while
+    // the cursor is outside CHASE_RADIUS.
+    if !cat.frozen && near {
+        let dx = local_x - cat.win_x;
+        let dy = local_y - cat.win_y;
+
+        if dx.abs() > 1.0 || dy.abs() > 1.0 {
+            cat.dir = dir_from_delta(dx, dy);
+        }
+
+        let max_x = (cat.logical_size.0 - SIZE as f32).max(0.0);
+        let max_y = (cat.logical_size.1 - SIZE as f32).max(0.0);
+        cat.win_x = (cat.win_x + dx * 0.3).clamp(0.0, max_x);
+        cat.win_y = (cat.win_y + dy * 0.3).clamp(0.0, max_y);
     }
 
-    // Runs once per 125ms main-loop iteration (see the `while` loop in
-    // main()): reads the cursor, updates the cat's animation state and
-    // position, then draws the current frame.
-    fn tick(&mut self) {
-        let (cursor_x, cursor_y) = mouse_pos();
+    cat.frame = !cat.frame; // alternates true/false each tick, for 2-frame poses
 
-        // "Idle" means the cursor has barely moved since last tick.
-        let cursor_moved = (cursor_x - self.last_cursor.0).abs() > 2.0
-            || (cursor_y - self.last_cursor.1).abs() > 2.0;
-        self.last_cursor = (cursor_x, cursor_y);
+    // Pick which sprite to show for the current state/direction/frame.
+    let (mut sprite, mut mask): (&'static [u8; 128], &'static [u8; 128]) = match state {
+        CatState::Sitting  => (&CAT_SITTING,    &CAT_SITTING_MASK),
+        CatState::Washing  => if cat.frame { (&CAT_WASHING_1,  &CAT_WASHING_1_MASK)  }
+                              else        { (&CAT_WASHING_2,  &CAT_WASHING_2_MASK)  },
+        CatState::Sleeping => if (cat.idle_ticks / 4) % 2 == 0
+                                   { (&CAT_SLEEPING_1, &CAT_SLEEPING_1_MASK) }
+                              else { (&CAT_SLEEPING_2, &CAT_SLEEPING_2_MASK) },
+        CatState::Chasing  => match (cat.dir, cat.frame) {
+            (Dir::E,  true)  => (&CAT_RIGHT1, &CAT_RIGHT1_MASK),
+            (Dir::E,  false) => (&CAT_RIGHT2, &CAT_RIGHT2_MASK),
+            (Dir::W,  true)  => (&CAT_LEFT1,  &CAT_LEFT1_MASK),
+            (Dir::W,  false) => (&CAT_LEFT2,  &CAT_LEFT2_MASK),
+            (Dir::N,  true)  => (&CAT_UP1,    &CAT_UP1_MASK),
+            (Dir::N,  false) => (&CAT_UP2,    &CAT_UP2_MASK),
+            (Dir::S,  true)  => (&CAT_DOWN1,  &CAT_DOWN1_MASK),
+            (Dir::S,  false) => (&CAT_DOWN2,  &CAT_DOWN2_MASK),
+            (Dir::NE, true)  => (&CAT_NE1,    &CAT_NE1_MASK),
+            (Dir::NE, false) => (&CAT_NE2,    &CAT_NE2_MASK),
+            (Dir::NW, true)  => (&CAT_NW1,    &CAT_NW1_MASK),
+            (Dir::NW, false) => (&CAT_NW2,    &CAT_NW2_MASK),
+            (Dir::SE, true)  => (&CAT_SE1,    &CAT_SE1_MASK),
+            (Dir::SE, false) => (&CAT_SE2,    &CAT_SE2_MASK),
+            (Dir::SW, true)  => (&CAT_SW1,    &CAT_SW1_MASK),
+            (Dir::SW, false) => (&CAT_SW2,    &CAT_SW2_MASK),
+        },
+    };
 
-        if cursor_moved { self.idle_ticks = 0; } else { self.idle_ticks += 1; }
-
-        // While frozen, keep the cat pinned in place but still let it settle
-        // into its idle animations if the cursor stops moving elsewhere.
-        let idle_ticks = if self.frozen { self.idle_ticks.max(3) } else { self.idle_ticks };
-
-        // Idle-duration thresholds (in ticks @ 125ms each) that step the cat
-        // through its idle animations: Sitting -> Washing -> Sleeping.
-        let state = if idle_ticks >= 20 {
-            CatState::Sleeping
-        } else if idle_ticks >= 10 {
-            CatState::Washing
-        } else if idle_ticks >= 3 {
-            CatState::Sitting
-        } else {
-            CatState::Chasing
-        };
-
-        // Occasional, non-distracting flavor: a speech bubble and/or a
-        // quirky sprite override, only while the cat is already idle.
-        // `moment_ticks_remaining` counts down while one is showing;
-        // `next_moment_in` counts down the (much longer) quiet period
-        // between moments. Tune the two "~Ns" ranges below to change how
-        // often moments happen and how long each one lasts.
-        if self.moment_ticks_remaining > 0 {
-            self.moment_ticks_remaining -= 1;
-        } else {
-            self.active_moment = None;
-            if state != CatState::Chasing {
-                if self.next_moment_in == 0 {
-                    let idx = (self.next_u32() as usize) % MOMENTS.len();
-                    self.active_moment = Some(idx);
-                    self.moment_ticks_remaining = 6 + self.next_u32() % 5; // ~0.75-1.25s
-                    self.next_moment_in = 240 + self.next_u32() % 561; // ~30-100s
-                } else {
-                    self.next_moment_in -= 1;
-                }
-            }
+    // If a Moment is currently active, let it override the sprite
+    // and/or supply the speech-bubble text picked above.
+    let mut bubble_text: &'static str = "";
+    if let Some(idx) = cat.active_moment {
+        bubble_text = MOMENTS[idx].text;
+        if let Some((qs, qm)) = MOMENTS[idx].quirk {
+            sprite = qs;
+            mask = qm;
         }
-
-        // Chase the cursor: ease toward it (30% of the remaining distance
-        // per tick, so movement looks smooth rather than snapping), clamped
-        // so the cat can't leave the screen. Skipped entirely while frozen.
-        if !self.frozen {
-            let dx = cursor_x - self.win_x;
-            let dy = cursor_y - self.win_y;
-
-            if dx.abs() > 1.0 || dy.abs() > 1.0 {
-                self.dir = dir_from_delta(dx, dy);
-            }
-
-            let max_x = (self.screen_w - SIZE as f32).max(0.0);
-            let max_y = (self.screen_h - SIZE as f32).max(0.0);
-            self.win_x = (self.win_x + dx * 0.3).clamp(0.0, max_x);
-            self.win_y = (self.win_y + dy * 0.3).clamp(0.0, max_y);
-        }
-
-        self.frame = !self.frame; // alternates true/false each tick, for 2-frame poses
-
-        // Pick which sprite to show for the current state/direction/frame.
-        let (mut sprite, mut mask): (&[u8; 128], &[u8; 128]) = match state {
-            CatState::Sitting  => (&CAT_SITTING,    &CAT_SITTING_MASK),
-            CatState::Washing  => if self.frame { (&CAT_WASHING_1,  &CAT_WASHING_1_MASK)  }
-                                  else          { (&CAT_WASHING_2,  &CAT_WASHING_2_MASK)  },
-            CatState::Sleeping => if (self.idle_ticks / 4) % 2 == 0
-                                       { (&CAT_SLEEPING_1, &CAT_SLEEPING_1_MASK) }
-                                  else { (&CAT_SLEEPING_2, &CAT_SLEEPING_2_MASK) },
-            CatState::Chasing  => match (self.dir, self.frame) {
-                (Dir::E,  true)  => (&CAT_RIGHT1, &CAT_RIGHT1_MASK),
-                (Dir::E,  false) => (&CAT_RIGHT2, &CAT_RIGHT2_MASK),
-                (Dir::W,  true)  => (&CAT_LEFT1,  &CAT_LEFT1_MASK),
-                (Dir::W,  false) => (&CAT_LEFT2,  &CAT_LEFT2_MASK),
-                (Dir::N,  true)  => (&CAT_UP1,    &CAT_UP1_MASK),
-                (Dir::N,  false) => (&CAT_UP2,    &CAT_UP2_MASK),
-                (Dir::S,  true)  => (&CAT_DOWN1,  &CAT_DOWN1_MASK),
-                (Dir::S,  false) => (&CAT_DOWN2,  &CAT_DOWN2_MASK),
-                (Dir::NE, true)  => (&CAT_NE1,    &CAT_NE1_MASK),
-                (Dir::NE, false) => (&CAT_NE2,    &CAT_NE2_MASK),
-                (Dir::NW, true)  => (&CAT_NW1,    &CAT_NW1_MASK),
-                (Dir::NW, false) => (&CAT_NW2,    &CAT_NW2_MASK),
-                (Dir::SE, true)  => (&CAT_SE1,    &CAT_SE1_MASK),
-                (Dir::SE, false) => (&CAT_SE2,    &CAT_SE2_MASK),
-                (Dir::SW, true)  => (&CAT_SW1,    &CAT_SW1_MASK),
-                (Dir::SW, false) => (&CAT_SW2,    &CAT_SW2_MASK),
-            },
-        };
-
-        // If a Moment is currently active, let it override the sprite
-        // and/or supply the speech-bubble text picked above.
-        let mut bubble_text = "";
-        if let Some(idx) = self.active_moment {
-            bubble_text = MOMENTS[idx].text;
-            if let Some((qs, qm)) = MOMENTS[idx].quirk {
-                sprite = qs;
-                mask = qm;
-            }
-        }
-
-        // Anchored TOP|LEFT; the cat's own sub-rect sits CAT_X/Y_OFFSET into
-        // the (larger, bubble-carrying) canvas, so shift the margin back by
-        // that offset to keep the cat itself tracking win_x/win_y exactly.
-        self.layer.set_margin(
-            self.win_y as i32 - CAT_Y_OFFSET,
-            0,
-            0,
-            self.win_x as i32 - CAT_X_OFFSET,
-        );
-        self.draw(sprite, mask, bubble_text);
     }
 
+    // Anchored TOP|LEFT; the cat's own sub-rect sits CAT_X/Y_OFFSET into
+    // the (larger, bubble-carrying) canvas, so shift the margin back by
+    // that offset to keep the cat itself tracking win_x/win_y exactly.
+    let new_state = DrawState {
+        margin_top: cat.win_y as i32 - CAT_Y_OFFSET,
+        margin_left: cat.win_x as i32 - CAT_X_OFFSET,
+        sprite,
+        mask,
+        bubble_text,
+    };
+
+    // Skip the SHM allocate/blit/damage/commit entirely when the frame
+    // would be pixel-for-pixel identical to what's already on screen (e.g.
+    // Sitting, most of Sleeping, or a frozen/motionless cat) - this is what
+    // was forcing the compositor to recomposite 8x/second forever even
+    // while the cat visually never changed.
+    if cat.last_drawn != Some(new_state) {
+        cat.layer.set_margin(new_state.margin_top, 0, 0, new_state.margin_left);
+        cat.draw(pool, sprite, mask, bubble_text);
+        cat.last_drawn = Some(new_state);
+    }
+}
+
+impl CatSurface {
     // Renders one frame: allocates a fresh ARGB8888 buffer sized to the full
     // canvas, unpacks `sprite`/`mask` into the cat's sub-rect within it
     // (everywhere else starts transparent), optionally draws a speech
@@ -972,9 +1090,8 @@ impl Cat {
     //
     // XBM layout: 4 bytes per row, LSB of each byte is the leftmost pixel.
     // mask bit set + sprite bit set => black, mask only => white, else transparent.
-    fn draw(&mut self, sprite: &[u8; 128], mask: &[u8; 128], text: &str) {
-        let (buffer, canvas) = self
-            .pool
+    fn draw(&mut self, pool: &mut SlotPool, sprite: &[u8; 128], mask: &[u8; 128], text: &str) {
+        let (buffer, canvas) = pool
             .create_buffer(
                 CANVAS_W as i32,
                 CANVAS_H as i32,
@@ -1011,15 +1128,28 @@ impl Cat {
         buffer.attach_to(surface).expect("attach buffer");
         self.layer.commit();
     }
+
+    // Unmaps the surface (no buffer attached) so it's invisible, without the
+    // cost of allocating/blitting a blank frame - used to hide the cat on
+    // every monitor except the one the cursor is currently on.
+    fn hide(&mut self) {
+        let surface = self.layer.wl_surface();
+        surface.attach(None, 0, 0);
+        surface.commit();
+        // The surface is now blank regardless of what was last drawn, so
+        // force the next active tick to redraw even if it computes the same
+        // DrawState this monitor had before being hidden.
+        self.last_drawn = None;
+    }
 }
 
 // --- SCTK/Wayland event-dispatch boilerplate below ---
-// These trait impls just wire Cat up to receive protocol events; most
+// These trait impls just wire App up to receive protocol events; most
 // methods are no-ops because this app doesn't care about those events
 // (e.g. we don't need to react to scale/transform changes). Only edit
 // these if you're changing what Wayland events the cat reacts to.
 
-impl CompositorHandler for Cat {
+impl CompositorHandler for App {
     fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: i32) {}
     fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
     fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
@@ -1027,39 +1157,99 @@ impl CompositorHandler for Cat {
     fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
 }
 
-// Tracks monitor geometry, so Cat::update_screen_size can keep the cat's
-// movement clamp (screen_w/screen_h) up to date.
-impl OutputHandler for Cat {
+// Tracks monitor add/remove/geometry-change, keeping `App.cats` in sync: one
+// CatSurface (its own layer-shell surface bound to that specific output) per
+// currently-connected monitor.
+impl OutputHandler for App {
     fn output_state(&mut self) -> &mut OutputState {
         &mut self.output_state
     }
 
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: wl_output::WlOutput) {
-        self.update_screen_size(&output);
+    fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        let Some(info) = self.output_state.info(&output) else { return };
+
+        let logical_position = info.logical_position.unwrap_or((0, 0));
+        let logical_size = info.logical_size.map(|(w, h)| (w as f32, h as f32)).unwrap_or_else(|| {
+            eprintln!("oneko: output {} has no logical size yet, defaulting to 1920x1080", info.id);
+            (1920.0, 1080.0)
+        });
+
+        let init_cursor = mouse_pos();
+        let cat = spawn_cat_surface(
+            &self.compositor,
+            &self.layer_shell,
+            qh,
+            output,
+            info.id,
+            logical_position,
+            logical_size,
+            init_cursor,
+        );
+        self.cats.push(cat);
     }
 
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: wl_output::WlOutput) {
-        self.update_screen_size(&output);
+        let Some(info) = self.output_state.info(&output) else { return };
+        let Some(cat) = self.cats.iter_mut().find(|c| c.output_id == info.id) else { return };
+
+        // Only overwrite cached geometry when the fresh info actually has
+        // it - a transient `None` here shouldn't clobber a good cached value.
+        if let Some(pos) = info.logical_position {
+            cat.logical_position = pos;
+        }
+        if let Some((w, h)) = info.logical_size {
+            cat.logical_size = (w as f32, h as f32);
+        }
     }
 
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        // Don't rely on output_state.info() here - it may already be gone by
+        // the time this fires. Match on the wl_output proxy's own id instead.
+        let removed_id = output.id();
+        let mut removed_output_id = None;
+        self.cats.retain(|c| {
+            if c.output.id() == removed_id {
+                removed_output_id = Some(c.output_id);
+                false
+            } else {
+                true
+            }
+        });
+        if self.active_output_id == removed_output_id {
+            self.active_output_id = None;
+        }
+    }
 }
 
-// The two events that matter for our layer-shell surface: the compositor
-// telling us it's ready for content (`configure`, gates the first draw in
-// main()'s loop) and telling us the surface was closed (`closed`, so we can
-// exit cleanly).
-impl LayerShellHandler for Cat {
-    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
-        self.exit = true;
+// The two events that matter for our layer-shell surfaces: the compositor
+// telling us one is ready for content (`configure`, gates the first draw for
+// that monitor) and telling us one was closed (`closed` - just drop that
+// monitor's CatSurface; the app keeps running with whatever monitors remain,
+// showing zero cats if none are left, and resumes via new_output on reconnect).
+impl LayerShellHandler for App {
+    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
+        let mut removed_output_id = None;
+        self.cats.retain(|c| {
+            if c.layer == *layer {
+                removed_output_id = Some(c.output_id);
+                false
+            } else {
+                true
+            }
+        });
+        if self.active_output_id == removed_output_id {
+            self.active_output_id = None;
+        }
     }
 
-    fn configure(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface, _: LayerSurfaceConfigure, _: u32) {
-        self.configured = true;
+    fn configure(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface, _: LayerSurfaceConfigure, _: u32) {
+        if let Some(cat) = self.cats.iter_mut().find(|c| &c.layer == layer) {
+            cat.configured = true;
+        }
     }
 }
 
-impl ShmHandler for Cat {
+impl ShmHandler for App {
     fn shm_state(&mut self) -> &mut Shm {
         &mut self.shm
     }
@@ -1067,7 +1257,7 @@ impl ShmHandler for Cat {
 
 // Binds a pointer as soon as one becomes available, so we can receive click
 // events (see PointerHandler below) to toggle `frozen`.
-impl SeatHandler for Cat {
+impl SeatHandler for App {
     fn seat_state(&mut self) -> &mut SeatState {
         &mut self.seat_state
     }
@@ -1103,10 +1293,11 @@ impl SeatHandler for Cat {
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
 }
 
-// This is the click-to-freeze feature: any left-button press received on
-// the cat's surface (only possible within its input region - see
-// input_region.add in main()) toggles `frozen`.
-impl PointerHandler for Cat {
+// This is the click-to-freeze feature: any left-button press received on a
+// cat's surface (only possible within its input region - see
+// spawn_cat_surface) toggles that monitor's `frozen`, routed by matching the
+// event's surface id against each CatSurface's own wl_surface id.
+impl PointerHandler for App {
     fn pointer_frame(
         &mut self,
         _: &Connection,
@@ -1116,26 +1307,32 @@ impl PointerHandler for Cat {
     ) {
         for event in events {
             if let PointerEventKind::Press { button: BTN_LEFT, .. } = event.kind {
-                self.frozen = !self.frozen;
+                if let Some(cat) = self
+                    .cats
+                    .iter_mut()
+                    .find(|c| c.layer.wl_surface().id() == event.surface.id())
+                {
+                    cat.frozen = !cat.frozen;
+                }
             }
         }
     }
 }
 
-impl ProvidesRegistryState for Cat {
+impl ProvidesRegistryState for App {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
     }
     registry_handlers![OutputState, SeatState];
 }
 
-delegate_compositor!(Cat);
-delegate_output!(Cat);
-delegate_shm!(Cat);
-delegate_layer!(Cat);
-delegate_seat!(Cat);
-delegate_pointer!(Cat);
-delegate_registry!(Cat);
+delegate_compositor!(App);
+delegate_output!(App);
+delegate_shm!(App);
+delegate_layer!(App);
+delegate_seat!(App);
+delegate_pointer!(App);
+delegate_registry!(App);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Connect to the Wayland compositor and discover available globals
@@ -1148,28 +1345,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let layer_shell = LayerShell::bind(&globals, &qh)?;
     let shm = Shm::bind(&globals, &qh)?;
 
-    // Create the always-on-top overlay surface the cat lives on.
-    let surface = compositor.create_surface(&qh);
-    let layer = layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("oneko"), None);
-    layer.set_anchor(Anchor::TOP | Anchor::LEFT);
-    // Canvas is bigger than the cat (room for a speech bubble above it).
-    layer.set_size(CANVAS_W, CANVAS_H);
-    // Position relative to the full output, ignoring bars' reserved space.
-    layer.set_exclusive_zone(-1);
-    layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-
-    // Input region covers only the cat's own sub-rect so it can receive
-    // clicks (to toggle frozen state) without the bubble area above it ever
-    // blocking clicks; clicks landing on the cat itself no longer pass
-    // through to whatever is beneath it.
-    let input_region = Region::new(&compositor)?;
-    input_region.add(CAT_X_OFFSET, CAT_Y_OFFSET, SIZE as i32, SIZE as i32);
-    layer.wl_surface().set_input_region(Some(input_region.wl_region()));
-
-    layer.commit();
-
-    // Shared-memory pool the cat's frames get drawn into (see Cat::draw).
-    let pool = SlotPool::new((CANVAS_W * CANVAS_H * 4) as usize, &shm)?;
+    // Shared-memory pool every monitor's cat frames get drawn into (see
+    // CatSurface::draw). Sized generously since multiple monitors can each
+    // have a buffer in flight at once; SlotPool grows further on demand.
+    let pool = SlotPool::new((CANVAS_W * CANVAS_H * 4 * 4) as usize, &shm)?;
 
     // Seed the PRNG from the clock; xorshift32 needs a nonzero seed, hence `| 1`.
     let seed = std::time::SystemTime::now()
@@ -1178,42 +1357,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(0x9E37_79B9)
         | 1;
 
-    let (init_x, init_y) = mouse_pos();
-    let mut cat = Cat {
+    let mut app = App {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
         seat_state: SeatState::new(&globals, &qh),
         pointer: None,
         shm,
         pool,
-        layer,
-        _input_region: input_region,
-        configured: false,
+        compositor,
+        layer_shell,
         exit: false,
-        screen_w: 1920.0,
-        screen_h: 1080.0,
-        win_x: init_x,
-        win_y: init_y,
-        last_cursor: (init_x, init_y),
-        dir: Dir::E,
-        frame: false,
-        idle_ticks: 0,
-        frozen: false,
+        cats: Vec::new(),
+        active_output_id: None,
         rng_state: seed,
-        next_moment_in: 300,
-        moment_ticks_remaining: 0,
-        active_moment: None,
     };
 
-    // Main loop: one animation tick every 125ms. `cat.configured` only
-    // becomes true after the compositor's first `configure` event (see
-    // LayerShellHandler above), so we don't try to draw before that.
-    while !cat.exit {
-        if cat.configured {
-            cat.tick();
+    // Main loop: one animation tick every 125ms. Every connected monitor
+    // gets its own overlay surface, created reactively in
+    // OutputHandler::new_output as outputs are announced. Each iteration we
+    // read the global cursor position once, figure out which monitor
+    // currently contains it, chase/animate only that one, and hide the cat
+    // on every other monitor.
+    while !app.exit {
+        let (cursor_x, cursor_y) = mouse_pos();
+
+        let active_id = app
+            .cats
+            .iter()
+            .find(|c| {
+                let (lx, ly) = c.logical_position;
+                let (lw, lh) = c.logical_size;
+                cursor_x >= lx as f32 && cursor_x < lx as f32 + lw
+                    && cursor_y >= ly as f32 && cursor_y < ly as f32 + lh
+            })
+            .map(|c| c.output_id);
+        if active_id.is_some() {
+            app.active_output_id = active_id;
         }
+
+        for cat in app.cats.iter_mut() {
+            if !cat.configured {
+                continue;
+            }
+            if Some(cat.output_id) == app.active_output_id {
+                let local_x = cursor_x - cat.logical_position.0 as f32;
+                let local_y = cursor_y - cat.logical_position.1 as f32;
+                tick_active(&mut app.rng_state, &mut app.pool, local_x, local_y, cat);
+                cat.visible = true;
+            } else if cat.visible {
+                cat.hide();
+                cat.visible = false;
+            }
+        }
+
         // Flushes pending requests (margin + buffer commit) and processes events.
-        event_queue.roundtrip(&mut cat)?;
+        event_queue.roundtrip(&mut app)?;
         thread::sleep(Duration::from_millis(125));
     }
 
