@@ -1,0 +1,8 @@
+[package]
+name = "oneko-daemon"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+oneko-core = { path = "../../oneko-core" }
+zbus = "4"

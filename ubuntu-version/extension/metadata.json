@@ -1,0 +1,7 @@
+{
+    "uuid": "oneko-rust@abishek-pechiappan.github.io",
+    "name": "oneko-rust",
+    "description": "A pixel-art cat that chases your cursor around the desktop. Thin GNOME Shell front-end for the oneko-rust daemon - see https://github.com/Abishek-Pechiappan/Oneko-Rust-Arch",
+    "shell-version": ["45", "46", "47"],
+    "url": "https://github.com/Abishek-Pechiappan/Oneko-Rust-Arch"
+}

@@ -14,7 +14,7 @@ command -v cargo >/dev/null 2>&1 || {
 echo "==> Building release binary..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
-cargo build --release
+cargo build --release -p "${BIN_NAME}"
 
 echo "==> Installing to ${INSTALL_DIR}..."
 mkdir -p "${INSTALL_DIR}"

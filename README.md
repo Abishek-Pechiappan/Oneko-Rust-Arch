@@ -1,6 +1,6 @@
 # oneko in rust
 
-A rewrite of the classic [**oneko**](https://github.com/tie/oneko) desktop cat, in **Rust**, for **Arch Linux + Hyprland**.
+A rewrite of the classic [**oneko**](https://github.com/tie/oneko) desktop cat, in **Rust**, for **Arch Linux + Hyprland** - plus a [GNOME/Ubuntu backend](ubuntu-version/) for everyone else.
 
 A little pixel-art cat chases your cursor around the screen. When you stop moving the mouse it sits down, washes itself, and eventually falls asleep — just like the 1990s X11 original, but running natively on Wayland, with multi-monitor support and a proximity-based chase so it doesn't chase your cursor across the whole desktop. Click the cat to freeze it in place; click again to let it resume chasing.
 
@@ -36,10 +36,18 @@ Move the cursor near the cat to wake it up and get chased; leave it alone (or st
 - [Hyprland](https://hypr.land) — the cursor tracking uses `hyprctl`; any other wlroots-based compositor would need a different cursor source
 - Rust toolchain (`rustup` or `pacman -S rust`)
 
+On GNOME (e.g. stock Ubuntu), none of the above applies — see
+[`ubuntu-version/`](ubuntu-version/) for a separate backend built around a
+GNOME Shell extension instead.
+
 ## Build & run
 
+This repo is a Cargo workspace; the Hyprland binary is the `oneko-rust`
+package within it (`hyprland/`), alongside the shared `oneko-core` crate and
+the GNOME backend's `oneko-daemon` crate:
+
 ```sh
-cargo build --release
+cargo build --release -p oneko-rust
 ./target/release/oneko-rust
 ```
 
@@ -71,7 +79,7 @@ Stop it with `pkill oneko-rust`.
 
 ## Limitations
 
-- Hyprland-specific: cursor tracking uses `hyprctl cursorpos`, so porting to another wlroots compositor means swapping out that one function for whatever that compositor exposes.
+- Hyprland-specific: cursor tracking uses `hyprctl cursorpos`, so porting to another wlroots compositor means swapping out that one function for whatever that compositor exposes. GNOME/Mutter doesn't support `wlr-layer-shell` or `hyprctl` at all — see [`ubuntu-version/`](ubuntu-version/) for that platform's separate GNOME Shell extension-based backend instead.
 - Clicks landing inside the cat's current 32×32 box are consumed to detect the freeze toggle, so anything beneath the cat at that instant won't receive that click.
 - Only one cat is shown at a time, on whichever monitor currently contains the cursor — it's not simultaneously visible/independent on every monitor.
 

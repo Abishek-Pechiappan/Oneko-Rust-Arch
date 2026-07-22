@@ -1,0 +1,8 @@
+[package]
+name = "oneko-rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+oneko-core = { path = "../oneko-core" }
+smithay-client-toolkit = "0.19"
