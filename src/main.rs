@@ -832,7 +832,9 @@ struct CatSurface {
     output: wl_output::WlOutput,
     output_id: u32, // OutputInfo.id - stable key, since wl_output's own Eq/Hash isn't relied on
     layer: LayerSurface,
-    _input_region: Region, // kept alive only; never read after setup
+    input_region: Region, // covers the cat's 32x32 sub-rect; re-applied when unhiding
+    empty_region: Region, // zero-area region swapped in while hidden so the
+                          // invisible-but-still-mapped surface never eats clicks
     configured: bool,      // true once the compositor has sent an initial configure event
     visible: bool,         // true while this is the monitor currently showing the cat
 
@@ -893,6 +895,9 @@ fn spawn_cat_surface(
     input_region.add(CAT_X_OFFSET, CAT_Y_OFFSET, SIZE as i32, SIZE as i32);
     layer.wl_surface().set_input_region(Some(input_region.wl_region()));
 
+    // Deliberately empty (no rects added) - see CatSurface::hide.
+    let empty_region = Region::new(compositor).expect("create empty region");
+
     layer.commit();
 
     let max_x = (logical_size.0 - SIZE as f32).max(0.0);
@@ -904,7 +909,8 @@ fn spawn_cat_surface(
         output,
         output_id,
         layer,
-        _input_region: input_region,
+        input_region,
+        empty_region,
         configured: false,
         visible: true,
         logical_position,
@@ -1129,25 +1135,44 @@ impl CatSurface {
         self.layer.commit();
     }
 
-    // Unmaps the surface (no buffer attached) so it's invisible, without the
-    // cost of allocating/blitting a blank frame - used to hide the cat on
-    // every monitor except the one the cursor is currently on.
-    fn hide(&mut self) {
+    // Makes the cat invisible by committing a fully transparent frame - used
+    // to hide the cat on every monitor except the one the cursor is on.
+    //
+    // Deliberately does NOT unmap (attach(None)): unmapping resets the layer
+    // surface's configured state compositor-side, requiring a full
+    // initial-commit/configure round-trip before a buffer may legally be
+    // attached again. A configure event already in flight when the unmap
+    // commit lands can then race our `configured` flag back to true early,
+    // and the next draw dies with "layerSurface was not configured, but a
+    // buffer was attached" (reproducibly hit when moving the cursor between
+    // monitors). Staying mapped with transparent pixels sidesteps that whole
+    // protocol state machine; the one-off blank frame is cheap since hide()
+    // only runs once per hide, not per tick (gated by `visible`).
+    fn hide(&mut self, pool: &mut SlotPool) {
+        // Swap in the empty input region so the invisible surface can't
+        // intercept clicks meant for whatever is underneath the cat's spot.
+        // Double-buffered state - applied by the commit below.
         let surface = self.layer.wl_surface();
-        surface.attach(None, 0, 0);
-        surface.commit();
+        surface.set_input_region(Some(self.empty_region.wl_region()));
+
+        let (buffer, canvas) = pool
+            .create_buffer(
+                CANVAS_W as i32,
+                CANVAS_H as i32,
+                (CANVAS_W * 4) as i32,
+                wl_shm::Format::Argb8888,
+            )
+            .expect("create shm buffer");
+        canvas.fill(0); // fully transparent
+
+        surface.damage_buffer(0, 0, CANVAS_W as i32, CANVAS_H as i32);
+        buffer.attach_to(surface).expect("attach buffer");
+        self.layer.commit();
+
         // The surface is now blank regardless of what was last drawn, so
         // force the next active tick to redraw even if it computes the same
         // DrawState this monitor had before being hidden.
         self.last_drawn = None;
-        // Attaching a null buffer unmaps the layer surface, and per
-        // wlr-layer-shell the compositor requires a fresh `configure` before
-        // a real buffer may be attached again. Without resetting this, the
-        // main loop's `!cat.configured` gate stays (stale) true and the next
-        // active tick attaches a buffer before that new configure arrives -
-        // "layerSurface was not configured, but a buffer was attached".
-        // Reported: crashes when moving the cursor off a monitor and back.
-        self.configured = false;
     }
 }
 
@@ -1408,12 +1433,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             if Some(cat.output_id) == app.active_output_id {
+                if !cat.visible {
+                    // Coming back from hidden: restore the cat's click
+                    // region (hide() swapped in the empty one). Applied by
+                    // the commit tick_active is guaranteed to make, since
+                    // hide() cleared last_drawn.
+                    cat.layer
+                        .wl_surface()
+                        .set_input_region(Some(cat.input_region.wl_region()));
+                }
                 let local_x = cursor_x - cat.logical_position.0 as f32;
                 let local_y = cursor_y - cat.logical_position.1 as f32;
                 tick_active(&mut app.rng_state, &mut app.pool, local_x, local_y, cat);
                 cat.visible = true;
             } else if cat.visible {
-                cat.hide();
+                cat.hide(&mut app.pool);
                 cat.visible = false;
             }
         }
