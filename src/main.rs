@@ -1140,6 +1140,14 @@ impl CatSurface {
         // force the next active tick to redraw even if it computes the same
         // DrawState this monitor had before being hidden.
         self.last_drawn = None;
+        // Attaching a null buffer unmaps the layer surface, and per
+        // wlr-layer-shell the compositor requires a fresh `configure` before
+        // a real buffer may be attached again. Without resetting this, the
+        // main loop's `!cat.configured` gate stays (stale) true and the next
+        // active tick attaches a buffer before that new configure arrives -
+        // "layerSurface was not configured, but a buffer was attached".
+        // Reported: crashes when moving the cursor off a monitor and back.
+        self.configured = false;
     }
 }
 
