@@ -1,1 +1,30 @@
+# Build output. build.rs writes the generated sprite tables to $OUT_DIR, which
+# lives in here, so nothing generated ever lands in the working tree.
 /target
+
+# Cargo.lock is deliberately NOT ignored: this is a binary crate, so pinning the
+# dependency tree is what makes a build reproducible for anyone who clones it.
+
+# Rust tooling leftovers
+**/*.rs.bk
+*.profraw
+
+# Profiling and crash artifacts, easy to leave behind after debugging the
+# event loop or the draw path
+perf.data
+perf.data.old
+*.core
+core.[0-9]*
+
+# Editors and IDEs
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+\#*\#
+.\#*
+
+# OS cruft
+.DS_Store
+Thumbs.db
