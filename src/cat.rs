@@ -82,7 +82,7 @@ const SLEEP_FRAME: u128 = 500;
 // into a strobe at 60 - the cat would vibrate rather than walk. Motion now
 // updates every tick while the sprite advances on this fixed clock, which is
 // what lets the tick rate rise without changing how the animation reads.
-const SPRITE_FRAME: Duration = Duration::from_millis(125);
+pub const SPRITE_FRAME: Duration = Duration::from_millis(125);
 
 // The reference tick the chase easing was originally tuned against, and the
 // fraction of the remaining distance the cat closed per such tick. `EASE_KEEP`
@@ -122,7 +122,7 @@ impl CatState {
     /// chasing, waking, or working on a wall. Only settled states get random
     /// Moments - a speech bubble mid-startle or mid-scratch would step on a
     /// pose that's saying something already.
-    fn is_settled(self) -> bool {
+    pub fn is_settled(self) -> bool {
         matches!(
             self,
             CatState::Sitting
@@ -305,6 +305,7 @@ pub struct CatSurface {
     pub configured: bool, // true once the compositor has sent an initial configure event
     pub visible: bool,    // true while this is the monitor currently showing the cat
 
+    pub output_name: Option<String>,  // connector name ("eDP-1"), to match fullscreen reports against
     pub logical_position: (i32, i32), // this output's offset in the global/layout coordinate space
     pub logical_size: (f32, f32),     // this output's size in that same space; used to clamp movement
 
@@ -340,6 +341,7 @@ pub fn spawn_cat_surface(
     qh: &QueueHandle<App>,
     output: wl_output::WlOutput,
     output_id: u32,
+    output_name: Option<String>,
     logical_position: (i32, i32),
     logical_size: (f32, f32),
     init_cursor: (f32, f32),
@@ -385,6 +387,7 @@ pub fn spawn_cat_surface(
         empty_region,
         configured: false,
         visible: true,
+        output_name,
         logical_position,
         logical_size,
         win_x,
@@ -594,10 +597,24 @@ pub fn tick_active(
     // Sitting, most of Sleeping, or a frozen/motionless cat) - this is what
     // was forcing the compositor to recomposite 8x/second forever even
     // while the cat visually never changed.
-    if cat.last_drawn != Some(new_state) {
-        cat.layer.set_margin(new_state.margin_top, 0, 0, new_state.margin_left);
-        cat.draw(pool, pose, bubble_text);
-        cat.last_drawn = Some(new_state);
+    //
+    // When only the position changed, the pixels already attached are still
+    // right: the margin is double-buffered surface state, so a bare commit
+    // moves the surface without a new buffer. While chasing, the sprite only
+    // changes on SPRITE_FRAME (8 Hz), so at --fps 30 this turns roughly
+    // two-thirds of all frames into a commit with no buffer work at all.
+    match cat.last_drawn {
+        Some(prev) if prev == new_state => {}
+        Some(prev) if prev.pose == new_state.pose && prev.bubble_text == new_state.bubble_text => {
+            cat.layer.set_margin(new_state.margin_top, 0, 0, new_state.margin_left);
+            cat.layer.commit();
+            cat.last_drawn = Some(new_state);
+        }
+        _ => {
+            cat.layer.set_margin(new_state.margin_top, 0, 0, new_state.margin_left);
+            cat.draw(pool, pose, bubble_text);
+            cat.last_drawn = Some(new_state);
+        }
     }
 
     state

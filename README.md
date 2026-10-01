@@ -14,6 +14,7 @@ A little pixel-art cat chases your cursor around the screen. Leave the mouse alo
 - **Proximity-based** — a parked cat stays parked instead of reacting to every mouse movement
 - **Random moments** — occasional speech bubbles (`meow`, `purrr~`, `nya~`) and quirky poses
 - **Click to freeze** it in place; click again to release
+- **Gets out of the way** of fullscreen games and videos, per monitor
 - **Multi-monitor aware**, including hotplug
 - **Six characters** — `neko`, `tora`, `dog`, `sakura`, `tomoyo`, `bsd` — plus your own
 - **Cheap to leave running** — 0.15% of one core while idle

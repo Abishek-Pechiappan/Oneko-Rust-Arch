@@ -4,6 +4,20 @@
 
 Nothing has been tagged yet, so everything below is on `main`.
 
+### Hides over fullscreen windows
+
+The cat now disappears from a monitor while it's showing a fullscreen window — a game, a video — and comes back where it left off once the window leaves fullscreen. It's per monitor, so a fullscreen video on one screen doesn't hide the cat on the other, and maximized windows don't count.
+
+On Hyprland this reads `j/monitors` and `j/clients` from the IPC socket twice a second. While hidden the tick drops to 500 ms, so a game doesn't pay for a cat it can't see. Other compositors need a `FullscreenSource` backend; without one the cat just never hides, as before. The startup line says which applies.
+
+### Less buffer work while chasing, fewer wakeups while idle
+
+- **Moving without redrawing.** The sprite changes 8×/second but the position changes every tick, and every position change used to allocate, fill and attach a new SHM buffer. Now a position-only change just updates the layer-shell margin and commits; the pixels already on screen are reused. A protocol trace of 7 s of chasing at `--fps 30` went from 114 buffer attaches to 67.
+- **Settled cats tick at 8 Hz.** Sitting, washing, scratching and yawning involve no motion, so the tick drops to the 125 ms sprite cadence instead of running at `--fps`. That's about 4× fewer cursor polls (7.5× at `--fps 60`) and wakeups during the wind-down. Noticing the cursor come back can take up to 125 ms — the original oneko's own reaction time.
+- **Release profile.** LTO, one codegen unit, `panic = "abort"` and stripping take the binary from 1.76 MB to 786 KB.
+
+The process's own CPU was already around 0.1% of one core, so the difference there is within measurement noise. The saving is mostly compositor-side: fewer buffers to import and upload.
+
 ### ~60× less idle CPU
 
 Cursor tracking no longer shells out to `hyprctl`. It talks to Hyprland's IPC socket directly, and the main loop is event-driven instead of a fixed sleep/round-trip cycle.

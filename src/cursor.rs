@@ -63,7 +63,9 @@ pub fn detect() -> Option<Box<dyn CursorSource>> {
 /// Hyprland serves one request per connection and closes it, so there is no
 /// persistent connection to keep: `position()` reconnects each poll. That's
 /// the cost already measured above, and at ~10 us a poll it isn't worth
-/// optimising further.
+/// optimising further. It also means the struct is just a path, so it's
+/// `Clone` and the fullscreen check holds its own copy.
+#[derive(Clone)]
 pub struct HyprlandIpc {
     socket: PathBuf,
 }
@@ -89,9 +91,12 @@ impl HyprlandIpc {
     }
 
     /// One request/response round trip. `Err` is deliberately collapsed into
-    /// `None` by the caller - a single failed poll is not worth reporting, and
+    /// `None` by callers - a single failed poll is not worth reporting, and
     /// definitely not worth killing the cat over.
-    fn query(&self) -> std::io::Result<String> {
+    ///
+    /// Also used by the fullscreen check in `fullscreen.rs`, which asks the same
+    /// socket different questions.
+    pub fn request(&self, command: &str) -> std::io::Result<String> {
         let mut stream = UnixStream::connect(&self.socket)?;
 
         // A wedged compositor must not wedge the cat: without these, a stalled
@@ -101,7 +106,7 @@ impl HyprlandIpc {
         stream.set_read_timeout(timeout)?;
         stream.set_write_timeout(timeout)?;
 
-        stream.write_all(b"cursorpos")?;
+        stream.write_all(command.as_bytes())?;
 
         // Read to EOF rather than a single `read`: Hyprland closes the socket
         // after replying, so EOF is the unambiguous end of the response and a
@@ -114,7 +119,7 @@ impl HyprlandIpc {
 
 impl CursorSource for HyprlandIpc {
     fn position(&mut self) -> Option<(f32, f32)> {
-        let reply = self.query().ok()?;
+        let reply = self.request("cursorpos").ok()?;
         parse_cursorpos(&reply)
     }
 

@@ -5,3 +5,11 @@ edition = "2021"
 
 [dependencies]
 smithay-client-toolkit = "0.19"
+
+# This runs in the background for the whole session, so favour a small,
+# tight binary over build speed.
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -32,6 +32,7 @@ use std::time::Instant;
 
 use crate::cat::{spawn_cat_surface, CatSurface};
 use crate::cursor::CursorSource;
+use crate::fullscreen::FullscreenSource;
 use crate::sprites::Skin;
 
 // linux/input-event-codes.h
@@ -65,6 +66,14 @@ pub struct App {
     // Where global cursor coordinates come from - one impl per compositor.
     // Boxed so adding an X11 / wlroots / KWin backend needs no change here.
     pub cursor: Box<dyn CursorSource>,
+
+    // Which monitors are showing a fullscreen window, so the cat can hide on
+    // them. `None` on compositors without a backend: the cat just never hides.
+    // `fullscreen_outputs` is the last answer, refreshed every FULLSCREEN_CHECK
+    // (see `main::tick`) and kept as-is when a refresh fails.
+    pub fullscreen: Option<Box<dyn FullscreenSource>>,
+    pub fullscreen_outputs: Vec<String>,
+    pub fullscreen_checked: Option<Instant>,
 
     // When the previous tick ran, so each tick can pass a real elapsed time
     // into tick_active instead of assuming a fixed interval. The tick interval
@@ -112,6 +121,7 @@ impl OutputHandler for App {
             qh,
             output,
             info.id,
+            info.name.clone(),
             logical_position,
             logical_size,
             init_cursor,
@@ -130,6 +140,9 @@ impl OutputHandler for App {
         }
         if let Some((w, h)) = info.logical_size {
             cat.logical_size = (w as f32, h as f32);
+        }
+        if info.name.is_some() {
+            cat.output_name = info.name.clone();
         }
     }
 

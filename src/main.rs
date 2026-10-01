@@ -7,6 +7,9 @@
 //   cursor   - where the global cursor position comes from; one backend per
 //              compositor, behind the `CursorSource` trait. Add new compositor
 //              support here and nothing else needs to change.
+//   fullscreen - which monitors are showing a fullscreen window, so the cat
+//              can hide there. Optional per compositor, behind `FullscreenSource`.
+//   json     - minimal JSON reader for Hyprland's IPC replies.
 //   cat      - per-monitor cat state, the per-tick behavior logic, and drawing.
 //   app      - shared Wayland/SCTK state and the event-dispatch boilerplate.
 //   main     - connects to Wayland, then runs the event loop below.
@@ -15,6 +18,8 @@ mod app;
 mod cat;
 mod cursor;
 mod font;
+mod fullscreen;
+mod json;
 mod moments;
 mod sprites;
 mod xbm;
@@ -36,7 +41,7 @@ use smithay_client_toolkit::{
 };
 
 use app::App;
-use cat::{tick_active, CatState, CANVAS_H, CANVAS_W};
+use cat::{tick_active, CatState, CANVAS_H, CANVAS_W, SPRITE_FRAME};
 use sprites::Skin;
 
 // Default motion updates per second.
@@ -86,6 +91,16 @@ const MAX_FPS: u32 = 240;
 // which the event loop watches continuously, so click-to-freeze stays instant no
 // matter how slow the tick is.
 const SLEEPING_TICK: Duration = Duration::from_millis(250);
+
+// How often to re-ask the compositor which monitors are showing a fullscreen
+// window, and the tick used while the cat is hidden by one.
+//
+// This is how long the cat can linger over a video that just went fullscreen,
+// or take to reappear after it leaves. Half a second is quick enough not to be
+// noticed in either direction, and two small IPC requests at 2 Hz is nothing.
+// While hidden, nothing is drawn and nothing needs to move, so there's no
+// reason to keep polling the cursor at motion rate during a game either.
+const FULLSCREEN_CHECK: Duration = Duration::from_millis(500);
 
 const HELP: &str = "\
 oneko-rust - a desktop cat that chases your cursor
@@ -217,11 +232,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
          \x20 HYPRLAND_INSTANCE_SIGNATURE). See src/cursor.rs for how to add a\n\
          \x20 backend for another compositor.",
     )?;
+    // Optional: without a backend the cat simply never hides for fullscreen.
+    let fullscreen = fullscreen::detect();
     eprintln!(
-        "oneko: skin {}, cursor backend {}, motion {:?}",
+        "oneko: skin {}, cursor backend {}, motion {:?}, hide over fullscreen: {}",
         skin.name,
         cursor.name(),
         motion_tick,
+        if fullscreen.is_some() { "yes" } else { "unsupported here" },
     );
 
     // Connect to the Wayland compositor and discover available globals
@@ -262,6 +280,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         skin,
         motion_tick,
         cursor,
+        fullscreen,
+        fullscreen_outputs: Vec::new(),
+        fullscreen_checked: None,
         last_tick: Instant::now(),
     };
 
@@ -308,6 +329,16 @@ fn tick(app: &mut App) -> Duration {
         return app.motion_tick;
     };
 
+    if let Some(source) = app.fullscreen.as_mut() {
+        if app.fullscreen_checked.is_none_or(|t| now.duration_since(t) >= FULLSCREEN_CHECK) {
+            // A failed read keeps the previous answer - see FullscreenSource.
+            if let Some(outputs) = source.fullscreen_outputs() {
+                app.fullscreen_outputs = outputs;
+            }
+            app.fullscreen_checked = Some(now);
+        }
+    }
+
     let active_id = app
         .cats
         .iter()
@@ -323,11 +354,21 @@ fn tick(app: &mut App) -> Duration {
     }
 
     let mut state = None;
+    let mut covered = false;
     for cat in app.cats.iter_mut() {
         if !cat.configured {
             continue;
         }
-        if Some(cat.output_id) == app.active_output_id {
+        let active = Some(cat.output_id) == app.active_output_id;
+        // A monitor showing a fullscreen window gets the same treatment as one
+        // without the cursor: hidden, not ticked. The cat's state is left as it
+        // was, so it picks up where it left off when the window goes away.
+        let fullscreen = cat
+            .output_name
+            .as_ref()
+            .is_some_and(|name| app.fullscreen_outputs.contains(name));
+        covered |= active && fullscreen;
+        if active && !fullscreen {
             if !cat.visible {
                 // Coming back from hidden: restore the cat's click region
                 // (hide() swapped in the empty one). Applied by the commit
@@ -354,10 +395,19 @@ fn tick(app: &mut App) -> Duration {
         }
     }
 
+    // Never tick faster than asked: at a low --fps the motion tick is already
+    // longer than these, and speeding up to idle would be absurd.
+    if covered {
+        return FULLSCREEN_CHECK.max(app.motion_tick);
+    }
     match state {
-        // Never tick slower than asked: at --fps 1 the motion tick is already
-        // longer than SLEEPING_TICK, and speeding up to sleep would be absurd.
         Some(CatState::Sleeping) => SLEEPING_TICK.max(app.motion_tick),
+        // Settled but awake (sitting, washing, ...): the cat isn't moving, only
+        // its sprite flips, and that happens on SPRITE_FRAME. Ticking faster
+        // just polls the cursor to learn nothing has changed. Noticing the
+        // cursor return can now take up to one SPRITE_FRAME (125 ms), which is
+        // exactly the original oneko's reaction time.
+        Some(s) if s.is_settled() => SPRITE_FRAME.max(app.motion_tick),
         _ => app.motion_tick,
     }
 }

@@ -88,9 +88,6 @@ which is a separate project in a different language.
   ping-pong two buffers instead of allocating per frame. Together these are what
   would make `--fps 60` cost what `--fps 30` does today — see the measurements
   in the [changelog](../CHANGELOG.md).
-- **Don't draw over fullscreen windows** — hide the cat when the focused window
-  is fullscreen, which Hyprland will report. Probably the highest-value item
-  here for whether people keep it running.
 - **Idle-aware sleeping** via `ext-idle-notify-v1` — sleep because the user is
   away, not just because the cursor is still, and stop polling entirely while
   they are.
